@@ -1,0 +1,499 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Furnace Monitor</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#101215;
+    --panel:#1a1d22;
+    --panel-2:#15171b;
+    --border:#262a31;
+    --text:#edeae2;
+    --text-muted:#868c96;
+    --scrap:#4c8dff;
+    --sponge:#f2a94e;
+    --tap:#ff4433;
+    --tilt:#ffd23f;
+    --idle:#4a4f58;
+    --good:#3ddc84;
+    --radius:10px;
+  }
+
+  *{ box-sizing:border-box; }
+
+  body{
+    margin:0;
+    background:var(--bg);
+    color:var(--text);
+    font-family:'IBM Plex Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+
+  .mono{
+    font-family:'IBM Plex Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+    font-variant-numeric:tabular-nums;
+  }
+
+  a{ color:inherit; }
+
+  .wrap{ max-width:1180px; margin:0 auto; padding:0 20px 40px; }
+
+  /* ---- header ---------------------------------------------------- */
+
+  .topbar{
+    display:flex;
+    align-items:center;
+    gap:20px;
+    padding:18px 0;
+    border-bottom:1px solid var(--border);
+    margin-bottom:20px;
+    flex-wrap:wrap;
+  }
+  .brand{
+    font-size:12px;
+    font-weight:600;
+    letter-spacing:.12em;
+    text-transform:uppercase;
+    color:var(--text-muted);
+  }
+  .heat-id{
+    font-size:15px;
+    font-weight:600;
+    letter-spacing:.04em;
+  }
+  .heat-id span{ font-family:'IBM Plex Mono', monospace; color:var(--sponge); }
+  .live{
+    display:flex;
+    align-items:center;
+    gap:8px;
+    font-size:11px;
+    letter-spacing:.1em;
+    text-transform:uppercase;
+    color:var(--text-muted);
+  }
+  .dot{
+    width:8px; height:8px; border-radius:50%;
+    background:var(--idle);
+  }
+  .dot.live{
+    background:var(--good);
+    box-shadow:0 0 0 0 rgba(61,220,132,.6);
+    animation:pulse 2s infinite;
+  }
+  .dot.down{ background:var(--tap); }
+  @keyframes pulse{
+    0%{ box-shadow:0 0 0 0 rgba(61,220,132,.55); }
+    70%{ box-shadow:0 0 0 7px rgba(61,220,132,0); }
+    100%{ box-shadow:0 0 0 0 rgba(61,220,132,0); }
+  }
+  .clock{
+    margin-left:auto;
+    font-size:14px;
+    color:var(--text-muted);
+  }
+
+  /* ---- main grid --------------------------------------------------- */
+
+  .grid{
+    display:grid;
+    grid-template-columns:1fr 340px;
+    gap:18px;
+    align-items:start;
+  }
+  @media (max-width:880px){
+    .grid{ grid-template-columns:1fr; }
+  }
+
+  .video-panel{
+    background:var(--panel);
+    border:1px solid var(--border);
+    border-radius:var(--radius);
+    overflow:hidden;
+  }
+  .video-frame{ position:relative; aspect-ratio:16/9; background:var(--panel-2); }
+  .video-frame img{
+    width:100%; height:100%; object-fit:cover; display:block;
+  }
+  .video-caption{
+    position:absolute; left:12px; bottom:10px;
+    font-size:10px; letter-spacing:.12em; text-transform:uppercase;
+    color:var(--text-muted);
+    background:rgba(16,18,21,.55);
+    padding:4px 8px; border-radius:4px;
+  }
+
+  .rail-panel{
+    background:var(--panel);
+    border:1px solid var(--border);
+    border-radius:var(--radius);
+    padding:16px;
+    display:flex;
+    flex-direction:column;
+    gap:14px;
+  }
+
+  .rail-stats{
+    display:grid;
+    grid-template-columns:1fr 1fr;
+    gap:10px;
+  }
+  .stat{
+    background:var(--panel-2);
+    border:1px solid var(--border);
+    border-radius:8px;
+    padding:10px 12px;
+  }
+  .stat-label{
+    display:block;
+    font-size:10px; letter-spacing:.1em; text-transform:uppercase;
+    color:var(--text-muted); margin-bottom:4px;
+  }
+  .stat-value{ font-size:20px; font-weight:600; }
+  .stat-value.mono{ font-family:'IBM Plex Mono', monospace; }
+
+  .tilt-banner{
+    display:none;
+    align-items:center; gap:8px;
+    background:rgba(255,210,63,.08);
+    border:1px solid rgba(255,210,63,.35);
+    color:var(--tilt);
+    border-radius:8px;
+    padding:8px 10px;
+    font-size:11px; letter-spacing:.08em; text-transform:uppercase; font-weight:600;
+  }
+  .tilt-banner.show{ display:flex; }
+  .tilt-banner .ping{
+    width:6px; height:6px; border-radius:50%; background:var(--tilt);
+    animation:pulse-tilt 1.1s infinite;
+  }
+  @keyframes pulse-tilt{
+    0%,100%{ opacity:1; } 50%{ opacity:.25; }
+  }
+
+  .rail{ list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:8px; }
+  .stage{
+    --accent:var(--idle);
+    display:grid;
+    grid-template-columns:auto 1fr auto;
+    align-items:center;
+    gap:10px;
+    padding:12px;
+    background:var(--panel-2);
+    border:1px solid var(--border);
+    border-left:3px solid var(--accent);
+    border-radius:8px;
+    transition:border-color .3s ease, background .3s ease;
+  }
+  .stage[data-stage="scrap_charging"]{ --accent:var(--scrap); }
+  .stage[data-stage="sponge_charging"]{ --accent:var(--sponge); }
+  .stage[data-stage="tapping"]{ --accent:var(--tap); }
+
+  .stage-num{
+    font-family:'IBM Plex Mono', monospace;
+    font-size:12px;
+    color:var(--text-muted);
+  }
+  .stage[data-state="active"] .stage-num,
+  .stage[data-state="done"] .stage-num{ color:var(--accent); }
+
+  .stage-body{ display:flex; flex-direction:column; gap:2px; min-width:0; }
+  .stage-name{ font-size:14px; font-weight:600; }
+  .stage-status{
+    font-size:10px; letter-spacing:.1em; text-transform:uppercase;
+    color:var(--text-muted);
+  }
+  .stage[data-state="active"] .stage-status{ color:var(--accent); }
+  .stage[data-state="active"]{
+    background:linear-gradient(180deg, color-mix(in srgb, var(--accent) 10%, var(--panel-2)), var(--panel-2));
+  }
+  .stage[data-state="done"]{ opacity:.72; }
+
+  .stage-time{ font-size:14px; color:var(--text-muted); }
+  .stage[data-state="active"] .stage-time{ color:var(--accent); font-weight:600; }
+  .stage[data-state="done"] .stage-time{ color:var(--text); }
+
+  /* ---- log ------------------------------------------------------ */
+
+  .log-panel{ margin-top:22px; }
+  .log-panel h2{
+    font-size:11px; letter-spacing:.12em; text-transform:uppercase;
+    color:var(--text-muted); font-weight:600; margin:0 0 10px;
+  }
+  table{ width:100%; border-collapse:collapse; font-size:13px; }
+  thead th{
+    text-align:left;
+    font-size:10px; letter-spacing:.08em; text-transform:uppercase;
+    color:var(--text-muted); font-weight:600;
+    padding:8px 10px;
+    border-bottom:1px solid var(--border);
+  }
+  tbody td{
+    padding:9px 10px;
+    border-bottom:1px solid var(--border);
+    font-family:'IBM Plex Mono', monospace;
+    font-variant-numeric:tabular-nums;
+  }
+  tbody td:first-child{ font-family:'IBM Plex Sans', sans-serif; font-weight:600; }
+  .empty-row td{ font-family:'IBM Plex Sans', sans-serif; color:var(--text-muted); font-style:italic; }
+
+  @media (prefers-reduced-motion: reduce){
+    .dot.live, .tilt-banner .ping{ animation:none; }
+  }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <header class="topbar">
+      <div class="brand">Furnace Monitor</div>
+      <div class="heat-id">HEAT <span id="heatId">--</span></div>
+      <div class="live">
+        <span class="dot" id="liveDot"></span>
+        <span id="liveLabel">CONNECTING</span>
+      </div>
+      <div class="clock mono" id="clock">--:--:--</div>
+    </header>
+
+    <main class="grid">
+      <section class="video-panel">
+        <div class="video-frame">
+          <img id="videoFeed" src="/video_feed" alt="Furnace camera feed" />
+          <div class="video-caption">RTSP camera · annotated</div>
+        </div>
+      </section>
+
+      <aside class="rail-panel">
+        <div class="rail-stats">
+          <div class="stat">
+            <span class="stat-label">Tilt count</span>
+            <span class="stat-value mono" id="tiltCount">0</span>
+          </div>
+          <div class="stat">
+            <span class="stat-label">Heat elapsed</span>
+            <span class="stat-value mono" id="heatElapsed">--:--</span>
+          </div>
+        </div>
+
+        <div class="tilt-banner" id="tiltBanner"><span class="ping"></span>Tilting in progress</div>
+
+        <ol class="rail">
+          <li class="stage" data-stage="scrap_charging" id="stage-scrap_charging" data-state="pending">
+            <span class="stage-num">01</span>
+            <span class="stage-body">
+              <span class="stage-name">Scrap charging</span>
+              <span class="stage-status" id="status-scrap_charging">Pending</span>
+            </span>
+            <span class="stage-time mono" id="time-scrap_charging">--:--</span>
+          </li>
+          <li class="stage" data-stage="sponge_charging" id="stage-sponge_charging" data-state="pending">
+            <span class="stage-num">02</span>
+            <span class="stage-body">
+              <span class="stage-name">Sponge charging</span>
+              <span class="stage-status" id="status-sponge_charging">Pending</span>
+            </span>
+            <span class="stage-time mono" id="time-sponge_charging">--:--</span>
+          </li>
+          <li class="stage" data-stage="tapping" id="stage-tapping" data-state="pending">
+            <span class="stage-num">03</span>
+            <span class="stage-body">
+              <span class="stage-name">Tapping</span>
+              <span class="stage-status" id="status-tapping">Pending</span>
+            </span>
+            <span class="stage-time mono" id="time-tapping">--:--</span>
+          </li>
+        </ol>
+      </aside>
+    </main>
+
+    <section class="log-panel">
+      <h2>Heat log</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Heat</th><th>Scrap</th><th>Sponge</th><th>Tap</th><th>Tilts</th><th>Total</th><th>Ended</th>
+          </tr>
+        </thead>
+        <tbody id="logBody">
+          <tr class="empty-row"><td colspan="7">No heats completed yet this session.</td></tr>
+        </tbody>
+      </table>
+    </section>
+  </div>
+
+<script>
+  const STAGES = ["scrap_charging", "sponge_charging", "tapping"];
+
+  const el = {
+    heatId: document.getElementById("heatId"),
+    liveDot: document.getElementById("liveDot"),
+    liveLabel: document.getElementById("liveLabel"),
+    clock: document.getElementById("clock"),
+    tiltCount: document.getElementById("tiltCount"),
+    heatElapsed: document.getElementById("heatElapsed"),
+    tiltBanner: document.getElementById("tiltBanner"),
+    logBody: document.getElementById("logBody"),
+  };
+
+  function fmtClock(){
+    el.clock.textContent = new Date().toLocaleTimeString();
+  }
+  setInterval(fmtClock, 1000);
+  fmtClock();
+
+  function fmtDuration(totalSeconds){
+    if (totalSeconds == null) return "--:--";
+    const s = Math.max(0, Math.floor(totalSeconds));
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const sec = s % 60;
+    const pad = n => String(n).padStart(2, "0");
+    return h > 0 ? `${h}:${pad(m)}:${pad(sec)}` : `${pad(m)}:${pad(sec)}`;
+  }
+
+  function setLive(isLive){
+    el.liveDot.classList.toggle("live", isLive);
+    el.liveDot.classList.toggle("down", !isLive);
+    el.liveLabel.textContent = isLive ? "Live" : "Reconnecting";
+  }
+
+  // ---- live ticking timers, corrected against each server snapshot -------
+
+  let latest = null;
+  let baseElapsed = 0;
+  let baseAt = performance.now();
+  let heatBaseElapsed = null;
+  let heatBaseAt = 0;
+
+  function stageDoneSeconds(events, stage){
+    return events
+      .filter(e => e.process === stage && e.duration_seconds != null)
+      .reduce((sum, e) => sum + e.duration_seconds, 0);
+  }
+
+  function applySnapshot(snap){
+    latest = snap;
+    baseElapsed = snap.active_stage_elapsed_seconds || 0;
+    baseAt = performance.now();
+
+    el.heatId.textContent = snap.heat_id ?? "--";
+    el.tiltCount.textContent = snap.tilt_count_this_heat ?? 0;
+    el.tiltBanner.classList.toggle("show", snap.current_state === "tilting");
+
+    if (snap.heat_started_at){
+      heatBaseElapsed = (Date.now() - new Date(snap.heat_started_at).getTime()) / 1000;
+      heatBaseAt = Date.now();
+    } else {
+      heatBaseElapsed = null;
+    }
+
+    const activeIdx = STAGES.indexOf(snap.active_stage);
+    const events = snap.heat_events || [];
+
+    STAGES.forEach((stage, i) => {
+      const li = document.getElementById("stage-" + stage);
+      const status = document.getElementById("status-" + stage);
+      const time = document.getElementById("time-" + stage);
+
+      let state = "pending";
+      if (snap.heat_id != null){
+        if (stage === snap.active_stage) state = "active";
+        else if (activeIdx !== -1 && i < activeIdx) state = "done";
+        else if (activeIdx === -1 && events.some(e => e.process === stage)) state = "done";
+      }
+      li.dataset.state = state;
+      status.textContent = state === "active" ? "Active" : state === "done" ? "Done" : "Pending";
+
+      if (state === "active"){
+        time.textContent = fmtDuration(baseElapsed);
+      } else if (state === "done"){
+        time.textContent = fmtDuration(stageDoneSeconds(events, stage));
+      } else {
+        time.textContent = "--:--";
+      }
+    });
+  }
+
+  function tick(){
+    if (!latest) return;
+    if (latest.active_stage){
+      const elapsed = baseElapsed + (performance.now() - baseAt) / 1000;
+      const timeEl = document.getElementById("time-" + latest.active_stage);
+      if (timeEl) timeEl.textContent = fmtDuration(elapsed);
+    }
+    if (heatBaseElapsed != null){
+      el.heatElapsed.textContent = fmtDuration(heatBaseElapsed + (Date.now() - heatBaseAt) / 1000);
+    } else {
+      el.heatElapsed.textContent = "--:--";
+    }
+  }
+  setInterval(tick, 250);
+
+  // ---- heat log ------------------------------------------------------
+
+  async function refreshHistory(){
+    try{
+      const res = await fetch("/api/history");
+      const heats = await res.json();
+      if (!heats.length){
+        el.logBody.innerHTML = '<tr class="empty-row"><td colspan="7">No heats completed yet this session.</td></tr>';
+        return;
+      }
+      el.logBody.innerHTML = heats.slice().reverse().map(h => {
+        const total = h.scrap_charging_seconds + h.sponge_charging_seconds;
+        const ended = h.ended_at ? new Date(h.ended_at).toLocaleTimeString() : "--";
+        return `<tr>
+          <td>#${h.heat_id}</td>
+          <td>${fmtDuration(h.scrap_charging_seconds)}</td>
+          <td>${fmtDuration(h.sponge_charging_seconds)}</td>
+          <td>${h.ended_at ? "✓" : "--"}</td>
+          <td>${h.tilt_count}</td>
+          <td>${fmtDuration(total)}</td>
+          <td>${ended}</td>
+        </tr>`;
+      }).join("");
+    } catch(err){
+      // leave table as-is; will retry on next interval
+    }
+  }
+  refreshHistory();
+  setInterval(refreshHistory, 5000);
+
+  // ---- websocket with polling fallback -------------------------------
+
+  let ws = null;
+  let pollTimer = null;
+
+  function startPolling(){
+    if (pollTimer) return;
+    pollTimer = setInterval(async () => {
+      try{
+        const res = await fetch("/api/status");
+        applySnapshot(await res.json());
+      } catch(err){ /* stay on last known snapshot */ }
+    }, 1000);
+  }
+
+  function connectWebSocket(){
+    const proto = location.protocol === "https:" ? "wss" : "ws";
+    ws = new WebSocket(`${proto}://${location.host}/ws/status`);
+
+    ws.onopen = () => {
+      setLive(true);
+      if (pollTimer){ clearInterval(pollTimer); pollTimer = null; }
+    };
+    ws.onmessage = (evt) => applySnapshot(JSON.parse(evt.data));
+    ws.onclose = () => {
+      setLive(false);
+      startPolling();
+      setTimeout(connectWebSocket, 2000);
+    };
+    ws.onerror = () => ws.close();
+  }
+
+  connectWebSocket();
+</script>
+</body>
+</html>

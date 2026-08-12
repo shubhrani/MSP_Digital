@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Furnace Process Monitor</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Oswald:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&family=Inter:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar__brand">
+    <span class="topbar__mark">FE</span>
+    <div class="topbar__title">
+      <h1>Furnace Process Monitor</h1>
+      <p>Scrap &middot; Sponge &middot; Tap &mdash; live cycle tracking</p>
+    </div>
+  </div>
+  <div class="topbar__status">
+    <div class="pill" id="camera-pill">
+      <span class="pill__dot" id="camera-dot"></span>
+      <span id="camera-text">Connecting</span>
+    </div>
+    <div class="topbar__clock" id="clock">--:--:--</div>
+  </div>
+</header>
+
+<main class="layout">
+
+  <section class="video-column">
+    <div class="video-frame">
+      <div class="video-frame__label">
+        <span class="live-dot"></span> LIVE
+      </div>
+      <img id="video" src="{{ url_for('video_feed') }}" alt="Furnace camera feed">
+    </div>
+
+    <!-- Signature element: the heat process line -->
+    <div class="process-line" id="process-line">
+
+      <div class="stage" data-stage="scrap_charging">
+        <div class="stage__eyebrow">01 &middot; Scrap Charging</div>
+        <div class="stage__timer" data-timer>00:00</div>
+        <div class="stage__range">expected 20&ndash;30 min</div>
+        <div class="stage__bar"><div class="stage__bar-fill" data-fill></div></div>
+      </div>
+
+      <div class="connector" data-connector="1"></div>
+
+      <div class="stage" data-stage="sponge_charging">
+        <div class="stage__eyebrow">02 &middot; Sponge Charging</div>
+        <div class="stage__timer" data-timer>00:00</div>
+        <div class="stage__range">expected 60&ndash;150 min</div>
+        <div class="stage__bar"><div class="stage__bar-fill" data-fill></div></div>
+      </div>
+
+      <div class="tilt-badge" id="tilt-badge" title="Furnace movements that returned to normal without tapping">
+        <span class="tilt-badge__icon">&#8635;</span>
+        <span class="tilt-badge__count" id="tilt-count">0</span>
+        <span class="tilt-badge__label">tilts</span>
+      </div>
+
+      <div class="connector" data-connector="2"></div>
+
+      <div class="stage" data-stage="tapping">
+        <div class="stage__eyebrow">03 &middot; Tapping</div>
+        <div class="stage__timer" data-timer>00:00</div>
+        <div class="stage__range">expected 10&ndash;20 min</div>
+        <div class="stage__bar"><div class="stage__bar-fill" data-fill></div></div>
+      </div>
+
+    </div>
+
+    <div class="event-log" id="event-log">Waiting for scrap charging to begin&hellip;</div>
+  </section>
+
+  <aside class="side-column">
+
+    <div class="card heat-card">
+      <div class="card__eyebrow">Current heat</div>
+      <div class="heat-card__id" id="heat-id">&mdash;</div>
+      <div class="heat-card__stage" id="heat-stage">IDLE</div>
+    </div>
+
+    <div class="card history-card">
+      <div class="card__eyebrow">Heat history</div>
+      <div class="history-table-wrap">
+        <table class="history-table">
+          <thead>
+            <tr>
+              <th>Heat</th>
+              <th>Start</th>
+              <th>Dur.</th>
+              <th>Tilts</th>
+              <th>Status</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody id="history-body">
+            <tr><td colspan="6" class="history-empty">No completed heats yet</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+  </aside>
+
+</main>
+
+<script src="{{ url_for('static', filename='js/dashboard.js') }}"></script>
+</body>
+</html>
