@@ -38,6 +38,19 @@ DEBOUNCE_FRAMES = 5
 JPEG_QUALITY = 80
 
 # ---------------------------------------------------------------------------
+# Furnace identity
+# ---------------------------------------------------------------------------
+# Which physical furnace this deployment is watching. Every row this
+# instance writes to SQL Server (Heats + HeatEvents) is tagged with this
+# value, so multiple furnaces can share one database/table set and still
+# be filtered/reported on independently (WHERE FurnaceId = '4/2').
+#
+# Override per-machine with an environment variable so the same codebase
+# can be copied to the 4/1 deployment later without editing this file:
+#     export FURNACE_ID="4/1"
+FURNACE_ID = os.getenv("FURNACE_ID", "4/2")
+
+# ---------------------------------------------------------------------------
 # Data storage
 # ---------------------------------------------------------------------------
 DATA_DIR = "data/heats"                       # one CSV per heat lives here

@@ -124,7 +124,7 @@ def backfill(data_dir=None, index_csv=None, dry_run=False, create_schema=None,
     }
 
     emit(f"Backfill: {len(index)} indexed heat(s), {len(heat_files)} heat file(s) "
-         f"-> {config.SQL_SERVER}/{config.SQL_DATABASE}"
+         f"-> {config.SQL_SERVER}/{config.SQL_DATABASE} (FurnaceId={config.FURNACE_ID})"
          f"{' [DRY RUN]' if dry_run else ''}")
 
     if not index and not heat_files:
@@ -161,9 +161,9 @@ def backfill(data_dir=None, index_csv=None, dry_run=False, create_schema=None,
                 emit(f"  {heat_id}  {status:<12} start={start} end={end} tilts={tilts}")
             else:
                 cursor.execute(db.SQL_UPSERT_HEAT_END,
-                               end, duration, tilts, status, heat_id,
-                               heat_id, number, start, end, duration, tilts, status,
-                               csv_file, host)
+                               config.FURNACE_ID, end, duration, tilts, status, heat_id,
+                               heat_id, config.FURNACE_ID, number, start, end, duration,
+                               tilts, status, csv_file, host)
             result["heats_written"] += 1
 
         if not dry_run:
@@ -181,8 +181,8 @@ def backfill(data_dir=None, index_csv=None, dry_run=False, create_schema=None,
             # analysis view can join to it.
             if heat_id not in index and not dry_run:
                 cursor.execute(db.SQL_UPSERT_HEAT_START,
-                               number, None, os.path.basename(path), host, heat_id,
-                               heat_id, number, None, os.path.basename(path), host)
+                               config.FURNACE_ID, number, None, os.path.basename(path), host, heat_id,
+                               heat_id, config.FURNACE_ID, number, None, os.path.basename(path), host)
 
             with open(path, newline="") as f:
                 rows = list(csv.DictReader(f))
@@ -203,7 +203,7 @@ def backfill(data_dir=None, index_csv=None, dry_run=False, create_schema=None,
                          f"{duration if duration is not None else '-'} min")
                 else:
                     cursor.execute(db.SQL_INSERT_EVENT,
-                                   key, heat_id, number, name, start, end,
+                                   key, heat_id, config.FURNACE_ID, number, name, start, end,
                                    duration, tilt_number, note, host, key)
                 result["events_written"] += 1
 

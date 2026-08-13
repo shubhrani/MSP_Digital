@@ -154,6 +154,7 @@ IF SCHEMA_ID('{config.SQL_SCHEMA}') IS NULL
 IF OBJECT_ID('{_HEATS_NAME}', 'U') IS NULL
 CREATE TABLE {HEATS} (
     HeatId          VARCHAR(64)    NOT NULL CONSTRAINT PK_Heats PRIMARY KEY,
+    FurnaceId       VARCHAR(16)    NOT NULL CONSTRAINT DF_Heats_FurnaceId DEFAULT (''),
     HeatNumber      INT            NULL,
     StartTime       DATETIME2(3)   NULL,
     EndTime         DATETIME2(3)   NULL,
@@ -173,6 +174,7 @@ CREATE TABLE {EVENTS} (
     EventId         BIGINT IDENTITY(1,1) NOT NULL CONSTRAINT PK_HeatEvents PRIMARY KEY,
     EventKey        CHAR(36)       NOT NULL,
     HeatId          VARCHAR(64)    NOT NULL,
+    FurnaceId       VARCHAR(16)    NOT NULL CONSTRAINT DF_HeatEvents_FurnaceId DEFAULT (''),
     HeatNumber      INT            NULL,
     EventName       VARCHAR(64)    NOT NULL,
     StartTime       DATETIME2(3)   NULL,
@@ -184,12 +186,39 @@ CREATE TABLE {EVENTS} (
     CreatedAt       DATETIME2(3)   NOT NULL CONSTRAINT DF_HeatEvents_CreatedAt DEFAULT (SYSDATETIME())
 );
 """,
+        # -- migration: add FurnaceId to tables created before this
+        #    column existed, so upgrading in place doesn't require a
+        #    manual ALTER TABLE against a live database -----------------
+        f"""
+IF OBJECT_ID('{_HEATS_NAME}', 'U') IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM sys.columns
+                    WHERE object_id = OBJECT_ID('{_HEATS_NAME}') AND name = 'FurnaceId')
+    ALTER TABLE {HEATS} ADD FurnaceId VARCHAR(16) NOT NULL CONSTRAINT DF_Heats_FurnaceId DEFAULT ('');
+""",
+        f"""
+IF OBJECT_ID('{_EVENTS_NAME}', 'U') IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM sys.columns
+                    WHERE object_id = OBJECT_ID('{_EVENTS_NAME}') AND name = 'FurnaceId')
+    ALTER TABLE {EVENTS} ADD FurnaceId VARCHAR(16) NOT NULL CONSTRAINT DF_HeatEvents_FurnaceId DEFAULT ('');
+""",
         # -- indexes -----------------------------------------------------
         f"""
 IF NOT EXISTS (SELECT 1 FROM sys.indexes
                WHERE name = 'UX_HeatEvents_EventKey'
                  AND object_id = OBJECT_ID('{_EVENTS_NAME}'))
     CREATE UNIQUE INDEX UX_HeatEvents_EventKey ON {EVENTS} (EventKey);
+""",
+        f"""
+IF NOT EXISTS (SELECT 1 FROM sys.indexes
+               WHERE name = 'IX_Heats_FurnaceId'
+                 AND object_id = OBJECT_ID('{_HEATS_NAME}'))
+    CREATE INDEX IX_Heats_FurnaceId ON {HEATS} (FurnaceId, StartTime) INCLUDE (Status, TiltCount);
+""",
+        f"""
+IF NOT EXISTS (SELECT 1 FROM sys.indexes
+               WHERE name = 'IX_HeatEvents_FurnaceId'
+                 AND object_id = OBJECT_ID('{_EVENTS_NAME}'))
+    CREATE INDEX IX_HeatEvents_FurnaceId ON {EVENTS} (FurnaceId, HeatId);
 """,
         f"""
 IF NOT EXISTS (SELECT 1 FROM sys.indexes
@@ -234,6 +263,7 @@ WITH stages AS (
 )
 SELECT
     h.HeatId,
+    h.FurnaceId,
     h.HeatNumber,
     h.Status,
     h.StartTime,
@@ -273,6 +303,7 @@ LEFT JOIN stages s ON s.HeatId = h.HeatId;
         f"""
 CREATE OR ALTER VIEW {SCHEMA}.[vw_HeatDaily] AS
 SELECT
+    FurnaceId,
     HeatDate,
     COUNT(*)                        AS HeatsCompleted,
     CAST(AVG(HeatMinutes)    AS DECIMAL(10,2)) AS AvgHeatMinutes,
@@ -286,7 +317,7 @@ SELECT
     SUM(TiltsSuppressed)            AS TotalTiltsSuppressed
 FROM {SCHEMA}.[vw_HeatAnalysis]
 WHERE Status = 'COMPLETE' AND HasUnknownStage = 0
-GROUP BY HeatDate;
+GROUP BY FurnaceId, HeatDate;
 """,
     ]
 
@@ -298,27 +329,27 @@ GROUP BY HeatDate;
 # writer thread so the race MERGE would guard against can't happen here.
 SQL_UPSERT_HEAT_START = f"""
 UPDATE {HEATS}
-   SET HeatNumber = ?, StartTime = ?, CsvFile = ?, SourceHost = ?, UpdatedAt = SYSDATETIME()
+   SET FurnaceId = ?, HeatNumber = ?, StartTime = ?, CsvFile = ?, SourceHost = ?, UpdatedAt = SYSDATETIME()
  WHERE HeatId = ?;
 IF @@ROWCOUNT = 0
-INSERT INTO {HEATS} (HeatId, HeatNumber, StartTime, Status, CsvFile, SourceHost)
-VALUES (?, ?, ?, 'IN_PROGRESS', ?, ?);
+INSERT INTO {HEATS} (HeatId, FurnaceId, HeatNumber, StartTime, Status, CsvFile, SourceHost)
+VALUES (?, ?, ?, ?, 'IN_PROGRESS', ?, ?);
 """
 
 SQL_UPSERT_HEAT_END = f"""
 UPDATE {HEATS}
-   SET EndTime = ?, DurationMinutes = ?, TiltCount = ?, Status = ?, UpdatedAt = SYSDATETIME()
+   SET FurnaceId = ?, EndTime = ?, DurationMinutes = ?, TiltCount = ?, Status = ?, UpdatedAt = SYSDATETIME()
  WHERE HeatId = ?;
 IF @@ROWCOUNT = 0
-INSERT INTO {HEATS} (HeatId, HeatNumber, StartTime, EndTime, DurationMinutes,
+INSERT INTO {HEATS} (HeatId, FurnaceId, HeatNumber, StartTime, EndTime, DurationMinutes,
                      TiltCount, Status, CsvFile, SourceHost)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
 """
 
 SQL_INSERT_EVENT = f"""
-INSERT INTO {EVENTS} (EventKey, HeatId, HeatNumber, EventName, StartTime, EndTime,
+INSERT INTO {EVENTS} (EventKey, HeatId, FurnaceId, HeatNumber, EventName, StartTime, EndTime,
                       DurationMinutes, TiltNumber, Note, SourceHost)
-SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
  WHERE NOT EXISTS (SELECT 1 FROM {EVENTS} WHERE EventKey = ?);
 """
 
@@ -472,6 +503,7 @@ class SqlRecorder:
             return {
                 "enabled": self.enabled,
                 "connected": self._connected,
+                "furnace_id": config.FURNACE_ID,
                 "server": config.SQL_SERVER if self.enabled else None,
                 "database": config.SQL_DATABASE if self.enabled else None,
                 "driver": detect_driver() if self.enabled else None,
@@ -491,6 +523,7 @@ class SqlRecorder:
         if not self.enabled:
             return
         payload["source_host"] = self.host
+        payload.setdefault("furnace_id", config.FURNACE_ID)
         self._queue.put(payload)
 
     def _run(self):
@@ -539,16 +572,18 @@ class SqlRecorder:
 
             if op == "heat_start":
                 heat_id = payload["heat_id"]
+                furnace_id = payload.get("furnace_id") or config.FURNACE_ID
                 number = _int(payload.get("heat_number"))
                 start = _dt(payload.get("start_time"))
                 csv_file = payload.get("csv_file")
                 host = payload.get("source_host")
                 cursor.execute(SQL_UPSERT_HEAT_START,
-                               number, start, csv_file, host, heat_id,
-                               heat_id, number, start, csv_file, host)
+                               furnace_id, number, start, csv_file, host, heat_id,
+                               heat_id, furnace_id, number, start, csv_file, host)
 
             elif op == "heat_end":
                 heat_id = payload["heat_id"]
+                furnace_id = payload.get("furnace_id") or config.FURNACE_ID
                 number = _int(payload.get("heat_number"))
                 start = _dt(payload.get("start_time"))
                 end = _dt(payload.get("end_time"))
@@ -558,15 +593,16 @@ class SqlRecorder:
                 csv_file = payload.get("csv_file")
                 host = payload.get("source_host")
                 cursor.execute(SQL_UPSERT_HEAT_END,
-                               end, duration, tilts, status, heat_id,
-                               heat_id, number, start, end, duration, tilts, status,
-                               csv_file, host)
+                               furnace_id, end, duration, tilts, status, heat_id,
+                               heat_id, furnace_id, number, start, end, duration, tilts,
+                               status, csv_file, host)
 
             elif op == "event":
                 key = payload["event_key"]
                 cursor.execute(SQL_INSERT_EVENT,
                                key,
                                payload["heat_id"],
+                               payload.get("furnace_id") or config.FURNACE_ID,
                                _int(payload.get("heat_number")),
                                payload["event_name"],
                                _dt(payload.get("start_time")),
@@ -720,20 +756,34 @@ class SqlRecorder:
 # ---------------------------------------------------------------------------
 # Read helpers (used by the API / verification, not by the hot path)
 # ---------------------------------------------------------------------------
-def fetch_recent_heats(limit=50):
+def fetch_recent_heats(limit=50, furnace_id=None):
     """Read the heat history back out of SQL Server. Raises on failure so
-    callers can fall back to the CSV index."""
+    callers can fall back to the CSV index.
+
+    furnace_id: pass to restrict to one furnace (e.g. config.FURNACE_ID);
+    leave as None to see every furnace sharing this database."""
     conn = connect()
     try:
         cursor = conn.cursor()
-        cursor.execute(f"""
-            SELECT TOP (?)
-                HeatId, HeatNumber, Status, StartTime, EndTime, HeatMinutes,
-                ScrapMinutes, SpongeMinutes, TappingMinutes, TiltCount,
-                TiltsSuppressed, HasUnknownStage
-            FROM {SCHEMA}.[vw_HeatAnalysis]
-            ORDER BY StartTime DESC
-        """, limit)
+        if furnace_id:
+            cursor.execute(f"""
+                SELECT TOP (?)
+                    HeatId, FurnaceId, HeatNumber, Status, StartTime, EndTime, HeatMinutes,
+                    ScrapMinutes, SpongeMinutes, TappingMinutes, TiltCount,
+                    TiltsSuppressed, HasUnknownStage
+                FROM {SCHEMA}.[vw_HeatAnalysis]
+                WHERE FurnaceId = ?
+                ORDER BY StartTime DESC
+            """, limit, furnace_id)
+        else:
+            cursor.execute(f"""
+                SELECT TOP (?)
+                    HeatId, FurnaceId, HeatNumber, Status, StartTime, EndTime, HeatMinutes,
+                    ScrapMinutes, SpongeMinutes, TappingMinutes, TiltCount,
+                    TiltsSuppressed, HasUnknownStage
+                FROM {SCHEMA}.[vw_HeatAnalysis]
+                ORDER BY StartTime DESC
+            """, limit)
         columns = [c[0] for c in cursor.description]
         rows = []
         for row in cursor.fetchall():

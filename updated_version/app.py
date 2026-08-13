@@ -74,6 +74,7 @@ def api_status():
     status = state_machine.get_status()
     status["camera_connected"] = camera_worker.is_connected()
     status["model_error"] = camera_worker.detector_error
+    status["furnace_id"] = config.FURNACE_ID
     return jsonify(status)
 
 
