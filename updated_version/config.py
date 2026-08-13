@@ -4,6 +4,8 @@ Edit the values below to match your setup. Nothing else in the
 codebase needs to change for a normal deployment.
 """
 
+import os
+
 # ---------------------------------------------------------------------------
 # Camera / stream
 # ---------------------------------------------------------------------------
@@ -40,6 +42,54 @@ JPEG_QUALITY = 80
 # ---------------------------------------------------------------------------
 DATA_DIR = "data/heats"                       # one CSV per heat lives here
 INDEX_CSV = "data/heats_index.csv"            # summary row per heat
+
+# ---------------------------------------------------------------------------
+# SQL Server
+# ---------------------------------------------------------------------------
+# Every value can be overridden by an environment variable of the same name,
+# so the server/credentials never have to be edited into a file that gets
+# committed or copied between machines. On the plant PC:
+#
+#     export SQL_SERVER="13.200.63.36,1433"
+#     export SQL_PASSWORD="..."       # or setx on Windows
+#
+# Turn the whole SQL path off (CSV only, exactly like before) with
+# SQL_ENABLED=0 - useful when testing away from the plant network.
+SQL_ENABLED = os.getenv("SQL_ENABLED", "1").lower() not in ("0", "false", "no")
+
+SQL_SERVER = os.getenv("SQL_SERVER", "10.135.20.195,1433")
+SQL_DATABASE = os.getenv("SQL_DATABASE", "Furnace")
+SQL_UID = os.getenv("SQL_UID", "sa")
+SQL_PASSWORD = os.getenv("SQL_PASSWORD", "Mampa#80631")
+
+# Leave empty to auto-detect the best installed ODBC driver
+# (18 -> 17 -> 13 -> Native Client -> "SQL Server").
+SQL_DRIVER = os.getenv("SQL_DRIVER", "ODBC Driver 17 for SQL Server")
+
+SQL_SCHEMA = os.getenv("SQL_SCHEMA", "dbo")
+SQL_HEATS_TABLE = "Heats"
+SQL_EVENTS_TABLE = "HeatEvents"
+
+# Create the tables/indexes/views on first connect if they aren't there.
+SQL_AUTO_CREATE_SCHEMA = True
+
+# Seconds. Login timeout is deliberately short: a dead database should be
+# noticed and spooled around quickly, not sat on.
+SQL_LOGIN_TIMEOUT = 5
+SQL_QUERY_TIMEOUT = 30
+
+# Reconnect backoff after a failure: starts at MIN, doubles up to MAX.
+SQL_RETRY_MIN_SECONDS = 5
+SQL_RETRY_MAX_SECONDS = 300
+
+# Rows that couldn't be written are appended here and replayed in order
+# once the database comes back. Deleted automatically once drained.
+SQL_SPOOL_FILE = "data/sql_spool.jsonl"
+
+# On startup, push any heat CSVs that aren't in the database yet - in a
+# background thread, so it never delays the camera or the dashboard.
+# Idempotent: re-running it inserts nothing new.
+SQL_BACKFILL_ON_START = True
 
 # ---------------------------------------------------------------------------
 # Flask

@@ -391,6 +391,12 @@ class SqlRecorder:
             self._last_error = "pyodbc is not installed (pip install pyodbc)"
             logger.warning("SQL recording disabled: %s", self._last_error)
 
+        if self.enabled and not config.SQL_PASSWORD:
+            # Not fatal - the login may be passwordless or trusted - but
+            # it's the most common reason for a first-run connect failure.
+            logger.warning("SQL_PASSWORD is empty; set the SQL_PASSWORD "
+                           "environment variable if the login needs one.")
+
         spool_parent = os.path.dirname(self.spool_file)
         if spool_parent:
             os.makedirs(spool_parent, exist_ok=True)

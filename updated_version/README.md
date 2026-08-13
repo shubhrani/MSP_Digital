@@ -209,3 +209,78 @@ link.
   stream and watch the "Last event" line on the dashboard while a heat runs
   to confirm the transitions line up with what you see on camera, and tune
   `CONFIDENCE_THRESHOLD` / `DEBOUNCE_FRAMES` from there.
+---
+
+## SQL Server recording
+
+Every row the app writes to a heat CSV is also pushed to SQL Server. The
+CSVs are unchanged and still written first, so the database is an addition,
+never a dependency - pull the network cable and the app carries on.
+
+### Setup
+
+1. `pip install pyodbc` and install the *ODBC Driver 17 (or 18) for SQL
+   Server* on the machine running the app.
+2. Set the connection details as environment variables (preferred) or edit
+   the `SQL Server` block in `config.py`:
+
+   ```bash
+   export SQL_SERVER="13.200.63.36,1433"
+   export SQL_DATABASE="Furnace"
+   export SQL_UID="furnace_app"
+   export SQL_PASSWORD="..."
+   ```
+3. `python3 check_sql.py` to confirm the login works.
+4. `python3 app.py`. Tables, indexes and views are created on first
+   connect, and the CSVs already on disk are loaded in the background.
+
+Set `SQL_ENABLED=0` to turn the whole SQL path off and run CSV-only.
+
+### Threads
+
+| Thread | Owns | Notes |
+| --- | --- | --- |
+| `CameraWorker` | RTSP + YOLO + state machine | Never touches the database |
+| `SqlRecorder` | The one SQL connection | Fed by a queue; writes, retries, spools |
+| `SqlBackfill` | One-shot CSV import at startup | Retries with backoff, then gives up quietly |
+
+The state machine calls `record_*()`, which puts a small dict on a queue
+and returns - measured at well under a millisecond per heat event, with the
+database deliberately unplugged. Nothing on the camera or request path ever
+waits on SQL Server.
+
+### When the database is down
+
+Rows go to `data/sql_spool.jsonl` instead, and are replayed **in order**
+the moment the connection comes back; the file is deleted once drained.
+Event keys are derived from `(heat_id, row number, event name)`, and every
+insert is guarded by `WHERE NOT EXISTS`, so replaying the spool - or
+re-running the CSV backfill - can't create duplicates.
+
+Check on it any time:
+
+```bash
+curl http://localhost:8000/api/sql/status
+```
+
+```jsonc
+{
+  "recorder": {"connected": true, "pending": 0, "spooled": 0,
+               "rows_written": 42, "rows_replayed": 3, "last_error": null},
+  "backfill": {"state": "done", "heats_written": 8, "events_written": 123}
+}
+```
+
+### Querying it
+
+`dbo.vw_HeatAnalysis` is one row per heat with the three stage durations
+pivoted out, tilt counts, unaccounted minutes and within-expected-range
+flags. `dbo.vw_HeatDaily` rolls that up per day. Point Power BI or SSMS at
+either one; see `sql/analysis_queries.sql` for worked examples.
+
+To load history manually (safe to repeat):
+
+```bash
+python3 migrate_csv_to_sql.py --dry-run   # show what would load
+python3 migrate_csv_to_sql.py             # load it
+```

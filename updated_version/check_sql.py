@@ -1,27 +1,29 @@
-import os
 import pyodbc
 import socket
+
+import config
+import db
 
 
 # ============================================================
 # SQL SERVER CONFIGURATION
 # ============================================================
+# Read from config.py (which reads the SQL_* environment variables), so
+# this diagnostic always tests exactly what the app itself will use - and
+# so the password lives in one place, outside the source tree.
 
-SQL_SERVER = os.getenv("SQL_SERVER", "13.200.63.36,1433")
-SQL_DATABASE = os.getenv("SQL_DATABASE", "Furnace")
-SQL_UID = os.getenv("SQL_UID", "sa")
-SQL_PASSWORD = os.getenv("SQL_PASSWORD", "Mampa#80631")
+SQL_SERVER = config.SQL_SERVER
+SQL_DATABASE = config.SQL_DATABASE
+SQL_UID = config.SQL_UID
+SQL_PASSWORD = config.SQL_PASSWORD
 
-DRIVER = "ODBC Driver 17 for SQL Server"
+DRIVER = db.detect_driver() or "ODBC Driver 17 for SQL Server"
 
-CONN_STR = (
-    f"DRIVER={{{DRIVER}}};"
-    f"SERVER={SQL_SERVER};"
-    f"DATABASE={SQL_DATABASE};"
-    f"UID={SQL_UID};"
-    f"PWD={SQL_PASSWORD};"
-    "TrustServerCertificate=yes;"
-)
+CONN_STR = db.build_connection_string(DRIVER)
+
+if not SQL_PASSWORD:
+    print("WARNING: no password set. Run:  export SQL_PASSWORD='...'  "
+          "(setx SQL_PASSWORD \"...\" on Windows) and try again.\n")
 
 
 # ============================================================

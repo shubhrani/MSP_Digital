@@ -98,8 +98,11 @@ tests/test_state_machine.py without OpenCV / ultralytics installed.
 
 import csv
 import datetime
+import logging
 import os
 import threading
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Class IDs used by the logic
@@ -159,7 +162,7 @@ MID_PROCESS_TAPPING_CLASS_IDS = {
     CLS_FURNACE_BOTTOM_FULL,
 }
 
-CSV_HEADERS = ["event", "start_time", "end_time", "duration_minutes", "tilt_number"]
+CSV_HEADERS = ["event", "start_time", "end_time", "duration_minutes", "tilt_number", "note"]
 INDEX_HEADERS = ["heat_id", "start_time", "end_time", "duration_minutes",
                   "tilt_count", "status", "csv_file"]
 
@@ -197,9 +200,15 @@ class HeatStateMachine:
     RELEVANT_CLASS_IDS = RELEVANT_CLASS_IDS
     EXPECTED_DURATION_MIN = EXPECTED_DURATION_MIN
 
-    def __init__(self, data_dir="data/heats", index_csv="data/heats_index.csv"):
+    def __init__(self, data_dir="data/heats", index_csv="data/heats_index.csv",
+                 recorder=None):
         self.data_dir = data_dir
         self.index_csv = index_csv
+        # Optional db.SqlRecorder. It only ever puts a dict on a queue, so
+        # calling it from here costs microseconds and can't block the
+        # camera thread no matter what the database is doing. Leave it as
+        # None and the class behaves exactly as it did before: CSV only.
+        self.recorder = recorder
         os.makedirs(self.data_dir, exist_ok=True)
         index_parent = os.path.dirname(self.index_csv)
         if index_parent:
@@ -213,6 +222,16 @@ class HeatStateMachine:
         self.heat_id = None
         self.heat_csv_path = None
         self.state = self.STATE_IDLE
+
+        # When the heat itself began, kept separately from scrap_start
+        # because scrap_start is cleared on a mid-process pickup.
+        self.heat_start = None
+        # Row number of the next event inside the current heat's CSV. The
+        # database's event key is derived from (heat_id, ordinal, name),
+        # so a live row and the same row later re-read by the CSV backfill
+        # produce an identical key - which is what makes the backfill safe
+        # to run over data the app already inserted.
+        self._event_ordinal = 0
 
         self.scrap_start = None
         self.sponge_start = None
@@ -391,6 +410,8 @@ class HeatStateMachine:
         with open(self.heat_csv_path, "w", newline="") as f:
             csv.writer(f).writerow(CSV_HEADERS)
 
+        self.heat_start = timestamp
+        self._event_ordinal = 0
         self.scrap_start = timestamp
         self.sponge_start = None
         self.tapping_start = None
@@ -404,6 +425,11 @@ class HeatStateMachine:
         self.last_event_desc = f"{self.heat_id}: scrap charging started"
 
         self._append_index_row(status="IN_PROGRESS", start=timestamp)
+        self._notify("record_heat_started",
+                     heat_id=self.heat_id,
+                     heat_number=self.heat_number,
+                     start_time=timestamp,
+                     csv_file=os.path.basename(self.heat_csv_path))
 
         if mid_process_stage == "sponge_charging":
             self._log_event("scrap_charging_unknown", None, None)
@@ -458,7 +484,7 @@ class HeatStateMachine:
         """Shared by both ways of confirming tapping. Closes out sponge
         charging, starts the tapping clock, and clears any pending watch -
         from here on only the 15-minute timer / class 3 end the heat."""
-        self._log_event("sponge_charging", self.sponge_start, sponge_end_time)
+        self._log_event("sponge_charging", self.sponge_start, sponge_end_time, note=note)
         self.tapping_start = tapping_start_time
         self.state = self.STATE_TAPPING
 
@@ -503,9 +529,22 @@ class HeatStateMachine:
     def _finalize_tapping(self, end_timestamp, reason=""):
         """Ends tapping and completes the heat. Triggered either by the
         15-minute timer or by a magnet_feeding_scrap detection."""
-        self._log_event("tapping", self.tapping_start, end_timestamp)
+        self._log_event("tapping", self.tapping_start, end_timestamp, note=reason)
         self._update_index_row(self.heat_id, status="COMPLETE", end=end_timestamp,
                                 tilt_count=self.tilt_count)
+
+        heat_minutes = (round((end_timestamp - self.heat_start).total_seconds() / 60.0, 2)
+                        if self.heat_start else None)
+        self._notify("record_heat_completed",
+                     heat_id=self.heat_id,
+                     heat_number=self.heat_number,
+                     start_time=self.heat_start,
+                     end_time=end_timestamp,
+                     duration_minutes=heat_minutes,
+                     tilt_count=self.tilt_count,
+                     status="COMPLETE",
+                     csv_file=os.path.basename(self.heat_csv_path) if self.heat_csv_path else None)
+
         suffix = f" ({reason})" if reason else ""
         self.last_event_desc = f"{self.heat_id}: tapping ended, heat complete{suffix}"
         self.state = self.STATE_IDLE
@@ -514,7 +553,7 @@ class HeatStateMachine:
     # -----------------------------------------------------------------
     # CSV helpers
     # -----------------------------------------------------------------
-    def _log_event(self, name, start, end, tilt_number=""):
+    def _log_event(self, name, start, end, tilt_number="", note=""):
         duration_min = round((end - start).total_seconds() / 60.0, 2) if start else ""
         row = [
             name,
@@ -522,6 +561,7 @@ class HeatStateMachine:
             end.isoformat() if end else "",
             duration_min,
             tilt_number,
+            note,
         ]
         with open(self.heat_csv_path, "a", newline="") as f:
             csv.writer(f).writerow(row)
@@ -531,7 +571,39 @@ class HeatStateMachine:
             "end": end.isoformat() if end else None,
             "duration_minutes": duration_min,
             "tilt_number": tilt_number,
+            "note": note,
         })
+
+        # Same row, same ordinal, straight onto the recorder's queue.
+        self._notify("record_event",
+                     heat_id=self.heat_id,
+                     heat_number=self.heat_number,
+                     event_name=name,
+                     start_time=start,
+                     end_time=end,
+                     duration_minutes=duration_min if duration_min != "" else None,
+                     tilt_number=tilt_number if tilt_number != "" else None,
+                     note=note or None,
+                     ordinal=self._event_ordinal)
+        self._event_ordinal += 1
+
+    # -----------------------------------------------------------------
+    # Recorder plumbing
+    # -----------------------------------------------------------------
+    def _notify(self, method, **kwargs):
+        """Hand a row to the SQL recorder, if one is attached.
+
+        Deliberately swallows everything: the CSV is the system of record
+        and the furnace doesn't stop for a database, so nothing on this
+        path may raise into the camera thread. The recorder's own queue
+        makes the call non-blocking; this try/except covers the rest.
+        """
+        if self.recorder is None:
+            return
+        try:
+            getattr(self.recorder, method)(**kwargs)
+        except Exception:
+            logger.exception("SQL recorder call %s failed (continuing on CSV only)", method)
 
     def _ensure_index_header(self):
         if not os.path.exists(self.index_csv):
