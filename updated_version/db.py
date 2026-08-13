@@ -346,11 +346,14 @@ INSERT INTO {HEATS} (HeatId, FurnaceId, HeatNumber, StartTime, EndTime, Duration
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
 """
 
-SQL_INSERT_EVENT = f"""
+SQL_UPSERT_EVENT = f"""
+UPDATE {EVENTS}
+   SET StartTime = ?, EndTime = ?, DurationMinutes = ?, TiltNumber = ?, Note = ?, SourceHost = ?
+ WHERE EventKey = ?;
+IF @@ROWCOUNT = 0
 INSERT INTO {EVENTS} (EventKey, HeatId, FurnaceId, HeatNumber, EventName, StartTime, EndTime,
                       DurationMinutes, TiltNumber, Note, SourceHost)
-SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
- WHERE NOT EXISTS (SELECT 1 FROM {EVENTS} WHERE EventKey = ?);
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
 """
 
 
@@ -599,19 +602,21 @@ class SqlRecorder:
 
             elif op == "event":
                 key = payload["event_key"]
-                cursor.execute(SQL_INSERT_EVENT,
-                               key,
-                               payload["heat_id"],
-                               payload.get("furnace_id") or config.FURNACE_ID,
-                               _int(payload.get("heat_number")),
-                               payload["event_name"],
-                               _dt(payload.get("start_time")),
-                               _dt(payload.get("end_time")),
-                               _num(payload.get("duration_minutes")),
-                               _int(payload.get("tilt_number")),
-                               (payload.get("note") or None),
-                               payload.get("source_host"),
-                               key)
+                start = _dt(payload.get("start_time"))
+                end = _dt(payload.get("end_time"))
+                duration = _num(payload.get("duration_minutes"))
+                tilt_number = _int(payload.get("tilt_number"))
+                note = payload.get("note") or None
+                host = payload.get("source_host")
+                furnace_id = payload.get("furnace_id") or config.FURNACE_ID
+                number = _int(payload.get("heat_number"))
+                
+                cursor.execute(SQL_UPSERT_EVENT,
+                               # UPDATE
+                               start, end, duration, tilt_number, note, host, key,
+                               # INSERT
+                               key, payload["heat_id"], furnace_id, number, payload["event_name"],
+                               start, end, duration, tilt_number, note, host)
 
             else:
                 logger.warning("Ignoring unknown SQL payload op: %r", op)

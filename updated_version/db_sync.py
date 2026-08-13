@@ -202,9 +202,12 @@ def backfill(data_dir=None, index_csv=None, dry_run=False, create_schema=None,
                     emit(f"  {heat_id}[{ordinal}] {name:<24} "
                          f"{duration if duration is not None else '-'} min")
                 else:
-                    cursor.execute(db.SQL_INSERT_EVENT,
-                                   key, heat_id, config.FURNACE_ID, number, name, start, end,
-                                   duration, tilt_number, note, host, key)
+                    cursor.execute(db.SQL_UPSERT_EVENT,
+                                   # UPDATE
+                                   start, end, duration, tilt_number, note, host, key,
+                                   # INSERT
+                                   key, heat_id, config.FURNACE_ID, number, name,
+                                   start, end, duration, tilt_number, note, host)
                 result["events_written"] += 1
 
             if not dry_run:

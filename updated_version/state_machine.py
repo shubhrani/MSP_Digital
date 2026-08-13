@@ -20,53 +20,27 @@ Logic (matches the classes to their numeric IDs, not their text names):
   different ways depending on how long sponge charging has already run:
 
   Under 130 minutes of sponge charging (the normal case):
-  12 furnace_position_tilding  \
-  18 furnace_position_up        }-> furnace leaves "normal" position.
-                                    We don't yet know if this is the start
-                                    of tapping or just an inspection tilt,
-                                    so the app starts "watching".
-  16 furnace_bottom_visiblecompletely
-                                 -> if seen while the furnace is being
-                                    watched, this CONFIRMS tapping. Sponge
-                                    charging is closed out at the moment
-                                    the furnace first left "normal"
-                                    position, and tapping starts from that
-                                    same moment.
+  12 furnace_position_tilding   -> furnace leaves "normal" position. We
+                                    don't yet know if this is the start of
+                                    tapping or just an inspection tilt, so
+                                    the app starts "watching".
   2  furnace_position_normal     -> furnace is back to normal position
-                                    while being watched and 16 was never
-                                    seen -> this was just a tilt (not
-                                    tapping). tilt_count += 1 *unless* a
-                                    tilt was already counted within the
-                                    last 2 minutes (see "Tilt cooldown"
-                                    below), and the app keeps waiting
-                                    inside sponge charging.
-  13 furnace_bottom_visiblepartially
-                                 -> tracked for information only while
-                                    watching; does not change any
-                                    transition on its own under 130 min.
+                                    while being watched -> this was just a
+                                    tilt (not tapping). tilt_count += 1,
+                                    and the app keeps waiting inside sponge
+                                    charging.
 
   From 130 minutes of sponge charging onward (fast-track):
-  12 / 13 / 16 / 18 (any one of them)
-                                 -> at this point the plant is confident
-                                    any of these movements really is the
-                                    start of tapping, so it's taken as
-                                    tapping starting immediately - no need
-                                    to also see the furnace return to
-                                    normal first. Because the visual
-                                    transition takes a little while to
-                                    register, the boundary between sponge
-                                    charging and tapping is backdated by
-                                    2 minutes 13 seconds (added to
-                                    tapping, deducted from sponge
-                                    charging) from the moment of
-                                    detection.
-
-  Tilt cooldown: once a tilt has been *counted*, any further "furnace
-  left normal, came back without tapping" cycle that resolves within 2
-  minutes of that counted tilt is treated as a continuation of the same
-  movement (camera/model flicker) rather than a brand-new tilt, so
-  tilt_count doesn't climb rapidly. These are still written to the heat's
-  CSV (as "tilt_ignored_cooldown") for audit purposes, just not counted.
+  12 furnace_position_tilding   -> at this point the plant is confident
+                                    this movement really is the start of
+                                    tapping, so it's taken as tapping
+                                    starting immediately - no need to also
+                                    see the furnace return to normal first.
+                                    Sponge charging is closed out and
+                                    tapping starts, both at this same
+                                    moment.
+  2  furnace_position_normal     -> (while TAPPING) tapping has ended and
+                                    the heat is complete.
 
   Starting mid-process (app restarted, or first launched, while a heat is
   already underway): if the first thing seen while IDLE is anything other
@@ -78,6 +52,7 @@ Logic (matches the classes to their numeric IDs, not their text names):
   duration instead of a guessed one.
 
   Ending a heat (tapping -> IDLE), whichever happens first:
+    - class 2 (furnace_position_normal) is detected while TAPPING, or
     - 15 minutes have passed since tapping started, or
     - 3 magnet_feeding_scrap is detected (this also means the *next* heat's
       scrap charging has begun, so a new heat starts immediately from this
@@ -86,11 +61,15 @@ Logic (matches the classes to their numeric IDs, not their text names):
 Assumptions made explicit (see README for more):
   - Tilt/tap watching only kicks in while sponge charging is the active
     stage, matching the described scrap -> sponge -> tapping flow.
-  - "2:13" is read as 2 minutes 13 seconds (mm:ss), matching how the rest
-    of the app displays durations.
-  - Once tapping is confirmed (either way), the furnace-position classes
-    (2/12/13/16/18) no longer drive any transition - only the 15-minute
-    timer and class 3 end a heat, per the plant's own description.
+  - Once tapping is confirmed (either way), only class 2 (to end it),
+    the 15-minute timer, and class 3 drive any further transition.
+
+Database: every stage (scrap/sponge/tapping) and every heat is pushed to
+the SQL recorder the moment it *starts* (see _notify_event_start /
+record_heat_started), not just when it finishes. The row is written with
+its start time and empty end/duration, then updated in place once that
+stage or heat ends - so a process appears in the database as soon as it
+begins, not only once it's complete.
 
 This module only depends on the standard library so it can be exercised by
 tests/test_state_machine.py without OpenCV / ultralytics installed.
@@ -111,9 +90,6 @@ CLS_FURNACE_NORMAL = 2
 CLS_MAGNET_FEEDING_SCRAP = 3
 CLS_SPONGE_FEEDER_ON_FURNACE = 8
 CLS_FURNACE_TILTING = 12
-CLS_FURNACE_BOTTOM_PARTIAL = 13
-CLS_FURNACE_BOTTOM_FULL = 16
-CLS_FURNACE_UP = 18
 
 # Classes the state machine actually reacts to. Passed to the debouncer so
 # it only tracks streaks for classes that matter.
@@ -122,19 +98,6 @@ RELEVANT_CLASS_IDS = {
     CLS_MAGNET_FEEDING_SCRAP,
     CLS_SPONGE_FEEDER_ON_FURNACE,
     CLS_FURNACE_TILTING,
-    CLS_FURNACE_BOTTOM_PARTIAL,
-    CLS_FURNACE_BOTTOM_FULL,
-    CLS_FURNACE_UP,
-}
-
-# Once sponge charging has run for at least this long, any one of these
-# classes is taken as tapping having started (fast-track - no need to also
-# watch for the furnace returning to normal first).
-FAST_TRACK_TAPPING_CLASS_IDS = {
-    CLS_FURNACE_TILTING,
-    CLS_FURNACE_BOTTOM_PARTIAL,
-    CLS_FURNACE_BOTTOM_FULL,
-    CLS_FURNACE_UP,
 }
 
 # ---------------------------------------------------------------------------
@@ -148,19 +111,14 @@ FAST_TRACK_TAPPING_CLASS_IDS = {
 # implies - scrap charging's own start time is simply unknown/unlogged in
 # that case.
 #
-# 8 spange_feeder_onfurnace, or the furnace visibly moving/tilted/up
+# 8 spange_feeder_onfurnace, or the furnace visibly moving
 # -> already in sponge charging (or a tilt inside it); jump straight there.
 MID_PROCESS_SPONGE_CLASS_IDS = {
     CLS_SPONGE_FEEDER_ON_FURNACE,
     CLS_FURNACE_TILTING,
-    CLS_FURNACE_UP,
-    CLS_FURNACE_BOTTOM_PARTIAL,
 }
-# 16 furnace_bottom_visiblecompletely on its own is the clearest possible
-# signal that tapping is already happening -> jump straight to tapping.
-MID_PROCESS_TAPPING_CLASS_IDS = {
-    CLS_FURNACE_BOTTOM_FULL,
-}
+# There's no longer a class that definitively indicates tapping on its own.
+MID_PROCESS_TAPPING_CLASS_IDS = set()
 
 CSV_HEADERS = ["event", "start_time", "end_time", "duration_minutes", "tilt_number", "note"]
 INDEX_HEADERS = ["heat_id", "start_time", "end_time", "duration_minutes",
@@ -177,18 +135,8 @@ EXPECTED_DURATION_MIN = {
 # ---------------------------------------------------------------------------
 # Tunable timing rules (see module docstring for what each one is for)
 # ---------------------------------------------------------------------------
-TILT_COOLDOWN_MINUTES = 2
-TILT_COOLDOWN = datetime.timedelta(minutes=TILT_COOLDOWN_MINUTES)
-
 SPONGE_FAST_TRACK_MINUTES = 130
 SPONGE_FAST_TRACK_THRESHOLD = datetime.timedelta(minutes=SPONGE_FAST_TRACK_MINUTES)
-
-# "2:13" -> 2 minutes 13 seconds, added to tapping / deducted from sponge
-# charging when the fast-track rule fires.
-TAPPING_BACKDATE = datetime.timedelta(minutes=2, seconds=13)
-
-TAPPING_MAX_MINUTES = 15
-TAPPING_MAX_DURATION = datetime.timedelta(minutes=TAPPING_MAX_MINUTES)
 
 
 class HeatStateMachine:
@@ -238,11 +186,8 @@ class HeatStateMachine:
         self.tapping_start = None
 
         self.tilt_count = 0
-        self.last_tilt_time = None
         self.furnace_watch_active = False
         self.furnace_watch_start = None
-        self.furnace_watch_saw_full_bottom = False
-        self.furnace_watch_saw_partial_bottom = False
 
         self.completed_events = []
         self.last_event_desc = "Waiting for scrap charging to begin..."
@@ -295,43 +240,30 @@ class HeatStateMachine:
             if CLS_SPONGE_FEEDER_ON_FURNACE in newly_confirmed_ids and self.state == self.STATE_SCRAP_CHARGING:
                 self._end_scrap_start_sponge(timestamp)
 
+            if self.state == self.STATE_TAPPING:
+                if CLS_FURNACE_NORMAL in newly_confirmed_ids:
+                    self._finalize_tapping(timestamp, reason="furnace returned to normal")
+
             if self.state == self.STATE_SPONGE_CHARGING:
-                fast_track_hit = bool(newly_confirmed_ids & FAST_TRACK_TAPPING_CLASS_IDS)
                 sponge_elapsed = timestamp - self.sponge_start if self.sponge_start else datetime.timedelta(0)
 
-                if fast_track_hit and sponge_elapsed >= SPONGE_FAST_TRACK_THRESHOLD:
-                    self._enter_tapping_fast_track(timestamp)
-                else:
-                    if (CLS_FURNACE_TILTING in newly_confirmed_ids or CLS_FURNACE_UP in newly_confirmed_ids) \
-                            and not self.furnace_watch_active:
+                if CLS_FURNACE_TILTING in newly_confirmed_ids:
+                    if sponge_elapsed >= SPONGE_FAST_TRACK_THRESHOLD:
+                        self._enter_tapping(timestamp, timestamp, note=">130 min sponge charging")
+                    elif not self.furnace_watch_active:
                         self._begin_furnace_watch(timestamp)
 
-                    if CLS_FURNACE_BOTTOM_PARTIAL in newly_confirmed_ids and self.furnace_watch_active:
-                        self.furnace_watch_saw_partial_bottom = True
-
-                    if CLS_FURNACE_BOTTOM_FULL in newly_confirmed_ids and self.furnace_watch_active \
-                            and not self.furnace_watch_saw_full_bottom:
-                        self._confirm_tapping(timestamp)
-
-                    if CLS_FURNACE_NORMAL in newly_confirmed_ids and self.furnace_watch_active:
-                        self._resolve_furnace_watch(timestamp)
+                if CLS_FURNACE_NORMAL in newly_confirmed_ids and self.furnace_watch_active:
+                    self._resolve_furnace_watch(timestamp)
 
             self.last_updated = timestamp
 
     def check_timeouts(self, timestamp=None):
-        """Evaluate any purely time-based transition (currently just the
-        15-minute tapping timer). Safe to call frequently and with no new
-        detections at all - call this periodically (e.g. once per camera
-        frame, and once per status request) so a heat still closes out on
-        time even if the classes above never fire again."""
-        timestamp = timestamp or datetime.datetime.now()
-        with self._lock:
-            self._check_timeouts_locked(timestamp)
+        pass
 
     def get_status(self):
         with self._lock:
             now = datetime.datetime.now()
-            self._check_timeouts_locked(now)
 
             current_start = {
                 self.STATE_SCRAP_CHARGING: self.scrap_start,
@@ -354,7 +286,6 @@ class HeatStateMachine:
                 "elapsed_seconds": elapsed,
                 "tilt_count": self.tilt_count,
                 "furnace_watch_active": self.furnace_watch_active,
-                "furnace_watch_saw_partial_bottom": self.furnace_watch_saw_partial_bottom,
                 "last_event": self.last_event_desc,
                 "events": list(self.completed_events),
                 "expected_duration_min": self.EXPECTED_DURATION_MIN,
@@ -387,16 +318,7 @@ class HeatStateMachine:
     # Internal transition handlers
     # -----------------------------------------------------------------
     def _check_timeouts_locked(self, timestamp):
-        """Must be called with self._lock already held."""
-        if self.state == self.STATE_TAPPING and self.tapping_start is not None:
-            if (timestamp - self.tapping_start) >= TAPPING_MAX_DURATION:
-                # Cap the logged end time at exactly the 15-minute mark
-                # rather than whenever this happened to be checked, so the
-                # duration is deterministic regardless of check frequency.
-                self._finalize_tapping(
-                    self.tapping_start + TAPPING_MAX_DURATION,
-                    reason=f"{TAPPING_MAX_MINUTES}-minute tapping timer elapsed",
-                )
+        pass
 
     def _start_new_heat(self, timestamp, mid_process_stage=None):
         """Starts a new heat. Normally this begins at scrap charging; if
@@ -416,10 +338,7 @@ class HeatStateMachine:
         self.sponge_start = None
         self.tapping_start = None
         self.tilt_count = 0
-        self.last_tilt_time = None
         self.furnace_watch_active = False
-        self.furnace_watch_saw_full_bottom = False
-        self.furnace_watch_saw_partial_bottom = False
         self.completed_events = []
         self.state = self.STATE_SCRAP_CHARGING
         self.last_event_desc = f"{self.heat_id}: scrap charging started"
@@ -440,6 +359,7 @@ class HeatStateMachine:
                 f"{self.heat_id}: app started mid-process - already in "
                 "sponge charging (scrap charging start unknown)"
             )
+            self._notify_event_start("sponge_charging", timestamp)
         elif mid_process_stage == "tapping":
             self._log_event("scrap_charging_unknown", None, None)
             self._log_event("sponge_charging_unknown", None, None)
@@ -451,75 +371,42 @@ class HeatStateMachine:
                 f"{self.heat_id}: app started mid-process - already in "
                 "tapping (scrap/sponge charging start unknown)"
             )
+            self._notify_event_start("tapping", timestamp)
+        else:
+            self._notify_event_start("scrap_charging", timestamp)
 
     def _end_scrap_start_sponge(self, timestamp):
         self._log_event("scrap_charging", self.scrap_start, timestamp)
         self.sponge_start = timestamp
         self.state = self.STATE_SPONGE_CHARGING
         self.last_event_desc = f"{self.heat_id}: sponge charging started"
+        self._notify_event_start("sponge_charging", timestamp)
 
     def _begin_furnace_watch(self, timestamp):
         self.furnace_watch_active = True
         self.furnace_watch_start = timestamp
-        self.furnace_watch_saw_full_bottom = False
-        self.furnace_watch_saw_partial_bottom = False
         self.last_event_desc = f"{self.heat_id}: furnace left normal position, watching..."
 
-    def _confirm_tapping(self, timestamp):
-        """Under-130-minute path: class 16 seen while watching a tilt."""
-        self.furnace_watch_saw_full_bottom = True
-        self._enter_tapping(self.furnace_watch_start, self.furnace_watch_start)
-
-    def _enter_tapping_fast_track(self, timestamp):
-        """130-minutes-and-over path: any of 12/13/16/18, backdated."""
-        boundary = timestamp - TAPPING_BACKDATE
-        if self.sponge_start and boundary < self.sponge_start:
-            boundary = self.sponge_start
-        self._enter_tapping(
-            boundary, boundary,
-            note=f"{SPONGE_FAST_TRACK_MINUTES}+ min sponge charging, backdated {TAPPING_BACKDATE}",
-        )
-
     def _enter_tapping(self, tapping_start_time, sponge_end_time, note=""):
-        """Shared by both ways of confirming tapping. Closes out sponge
-        charging, starts the tapping clock, and clears any pending watch -
-        from here on only the 15-minute timer / class 3 end the heat."""
+        """Closes out sponge charging and starts the tapping clock."""
         self._log_event("sponge_charging", self.sponge_start, sponge_end_time, note=note)
         self.tapping_start = tapping_start_time
         self.state = self.STATE_TAPPING
 
         self.furnace_watch_active = False
         self.furnace_watch_start = None
-        self.furnace_watch_saw_full_bottom = False
-        self.furnace_watch_saw_partial_bottom = False
 
         suffix = f" ({note})" if note else ""
         self.last_event_desc = f"{self.heat_id}: tapping started{suffix}"
+        self._notify_event_start("tapping", tapping_start_time)
 
     def _resolve_furnace_watch(self, timestamp):
-        """Class 2 (furnace back to normal) seen while watching. Since
-        tapping being confirmed always clears furnace_watch_active first,
-        reaching this point means tapping was NOT confirmed - it's a tilt
-        candidate, subject to the cooldown."""
+        """Class 2 (furnace back to normal) seen while watching -> tilt completed."""
         watch_start = self.furnace_watch_start
         self.furnace_watch_active = False
         self.furnace_watch_start = None
-        self.furnace_watch_saw_full_bottom = False
-        self.furnace_watch_saw_partial_bottom = False
-
-        if self.last_tilt_time is not None and (timestamp - self.last_tilt_time) < TILT_COOLDOWN:
-            # Within the cooldown window of the last *counted* tilt -
-            # treat this as a continuation of the same movement rather
-            # than a brand-new one, so the count doesn't climb rapidly.
-            self._log_event("tilt_ignored_cooldown", watch_start, timestamp)
-            self.last_event_desc = (
-                f"{self.heat_id}: furnace back to normal - within "
-                f"{TILT_COOLDOWN_MINUTES}-min cooldown, not counted"
-            )
-            return
 
         self.tilt_count += 1
-        self.last_tilt_time = timestamp
         self._log_event("tilt", watch_start, timestamp, tilt_number=self.tilt_count)
         self.last_event_desc = (
             f"{self.heat_id}: furnace back to normal - tilt #{self.tilt_count} "
@@ -586,6 +473,18 @@ class HeatStateMachine:
                      note=note or None,
                      ordinal=self._event_ordinal)
         self._event_ordinal += 1
+
+    def _notify_event_start(self, name, start_time):
+        self._notify("record_event",
+                     heat_id=self.heat_id,
+                     heat_number=self.heat_number,
+                     event_name=name,
+                     start_time=start_time,
+                     end_time=None,
+                     duration_minutes=None,
+                     tilt_number=None,
+                     note=None,
+                     ordinal=self._event_ordinal)
 
     # -----------------------------------------------------------------
     # Recorder plumbing

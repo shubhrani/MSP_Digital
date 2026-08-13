@@ -26,7 +26,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import db  # noqa: E402
-from state_machine import HeatStateMachine, TAPPING_MAX_DURATION  # noqa: E402
+from state_machine import HeatStateMachine  # noqa: E402
 
 TMP_DIR = os.path.join(os.path.dirname(__file__), "_tmp_db")
 BASE = datetime.datetime(2026, 8, 11, 8, 0, 0)
@@ -138,11 +138,10 @@ def test_state_machine_feeds_the_recorder():
 
     sm.process_detections({3}, t(0))            # heat starts
     sm.process_detections({8}, t(25))           # scrap -> sponge
-    sm.process_detections({12}, t(70))          # tilt begins
+    sm.process_detections({12}, t(70))          # tilt begins (< 130 min sponge)
     sm.process_detections({2}, t(71))           # tilt resolves, counted
-    sm.process_detections({18}, t(100))         # furnace moves
-    sm.process_detections({16}, t(101))         # tapping confirmed
-    sm.check_timeouts(t(100) + TAPPING_MAX_DURATION + datetime.timedelta(minutes=1))
+    sm.process_detections({12}, t(160))         # >= 130 min sponge -> tapping starts
+    sm.process_detections({2}, t(175))          # furnace back to normal -> tapping ends
 
     starts = rec.of("heat_start")
     assert len(starts) == 1, starts
@@ -154,22 +153,27 @@ def test_state_machine_feeds_the_recorder():
     by_name = {e["event_name"]: e for e in events}
     assert by_name["scrap_charging"]["duration_minutes"] == 25.0
     assert by_name["scrap_charging"]["start_time"] == t(0)
-    assert by_name["sponge_charging"]["duration_minutes"] == 75.0
+    assert by_name["sponge_charging"]["duration_minutes"] == 135.0
     assert by_name["tapping"]["duration_minutes"] == 15.0
     assert by_name["tilt"]["tilt_number"] == 1
     # The tapping row carries why the heat ended.
-    assert "timer" in (by_name["tapping"]["note"] or "")
+    assert "normal" in (by_name["tapping"]["note"] or "")
 
     # Ordinals must match the row order in the CSV, since that's what
-    # makes the event keys line up with a later CSV backfill.
-    assert [e["ordinal"] for e in events] == list(range(len(events)))
+    # makes the event keys line up with a later CSV backfill. Only rows
+    # that actually land in the CSV count here - the "started" placeholder
+    # notifications (end_time is None) intentionally reuse the ordinal of
+    # the completed row that follows them, so the two resolve to the same
+    # DB key.
+    logged = [e for e in events if e["end_time"] is not None]
+    assert [e["ordinal"] for e in logged] == list(range(len(logged)))
 
     ends = rec.of("heat_end")
     assert len(ends) == 1
     assert ends[0]["status"] == "COMPLETE"
     assert ends[0]["tilt_count"] == 1
-    assert ends[0]["end_time"] == t(100) + TAPPING_MAX_DURATION
-    assert ends[0]["duration_minutes"] == 115.0   # t(0) -> t(115)
+    assert ends[0]["end_time"] == t(175)
+    assert ends[0]["duration_minutes"] == 175.0   # t(0) -> t(175)
 
     print("test_state_machine_feeds_the_recorder passed.")
 
