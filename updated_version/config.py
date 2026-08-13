@@ -8,7 +8,7 @@ codebase needs to change for a normal deployment.
 # Camera / stream
 # ---------------------------------------------------------------------------
 # Example: "rtsp://user:password@192.168.1.64:554/Streaming/Channels/101"
-RTSP_URL = "rtsp://admin:Admin@1234@10.50.40.151:554/video/live?channel=1&subtype=0"
+RTSP_URL = "rtsp://admin:Admin@1234@10.50.40.152:554/video/live?channel=1&subtype=0"
 
 # If the RTSP connection drops, wait this many seconds before retrying.
 RECONNECT_DELAY_SECONDS = 5
@@ -19,7 +19,7 @@ RECONNECT_DELAY_SECONDS = 5
 MODEL_PATH = "models/best_latest_model.pt"
 
 # Minimum confidence for a detection to be considered at all.
-CONFIDENCE_THRESHOLD = 0.3
+CONFIDENCE_THRESHOLD = 0.5
 
 # Run detection on every Nth frame (1 = every frame). Raise this on slower
 # hardware / CPU-only machines to keep the video feed smooth. The video

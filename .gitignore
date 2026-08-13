@@ -1,4 +1,7 @@
-﻿.venv/
+.venv/
 .idea/
 __pycache__/
 *.pyc
+Updated_version/venv/
+updated_version/venv/
+
