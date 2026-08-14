@@ -29,22 +29,35 @@ def main():
     parser = argparse.ArgumentParser(description="Backfill heat CSVs into SQL Server.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Parse and report, but don't write to the database.")
-    parser.add_argument("--data-dir", default=config.DATA_DIR)
-    parser.add_argument("--index-csv", default=config.INDEX_CSV)
+    parser.add_argument("--furnace-id", choices=sorted({f["furnace_id"] for f in config.FURNACES.values()}),
+                        default=config.FURNACE_ID,
+                        help="Which furnace these CSVs belong to (default: %(default)s). "
+                             "Picks that furnace's own data-dir/index-csv unless overridden below.")
+    parser.add_argument("--data-dir", default=None)
+    parser.add_argument("--index-csv", default=None)
     args = parser.parse_args()
+
+    # Resolve data-dir/index-csv from the chosen furnace unless the caller
+    # gave explicit paths.
+    furnace_cfg = next((f for f in config.FURNACES.values() if f["furnace_id"] == args.furnace_id),
+                       None)
+    data_dir = args.data_dir or (furnace_cfg["data_dir"] if furnace_cfg else config.DATA_DIR)
+    index_csv = args.index_csv or (furnace_cfg["index_csv"] if furnace_cfg else config.INDEX_CSV)
 
     print("=" * 62)
     print("CSV -> SQL SERVER BACKFILL")
     print("=" * 62)
-    print(f"Index file   : {args.index_csv}")
-    print(f"Heat files   : {args.data_dir}")
+    print(f"Furnace      : {args.furnace_id}")
+    print(f"Index file   : {index_csv}")
+    print(f"Heat files   : {data_dir}")
     print(f"Target       : {config.SQL_SERVER} / {config.SQL_DATABASE}")
     print(f"Mode         : {'DRY RUN - nothing will be written' if args.dry_run else 'WRITE'}")
     print("=" * 62)
 
     try:
-        result = db_sync.backfill(data_dir=args.data_dir,
-                                  index_csv=args.index_csv,
+        result = db_sync.backfill(data_dir=data_dir,
+                                  index_csv=index_csv,
+                                  furnace_id=args.furnace_id,
                                   dry_run=args.dry_run,
                                   emit=print)
     except Exception as exc:

@@ -37,10 +37,12 @@ import db
 
 logger = logging.getLogger(__name__)
 
-# Populated by the background thread so /api/sql/status can report on it.
-_last_result = {"state": "not_started"}
+# Populated by the background thread(s) so /api/sql/status can report on
+# them. Keyed by furnace slug (e.g. "4-1", "4-2") so two furnaces backfilling
+# at once don't stomp on each other's status / thread handle.
+_last_results = {}
 _lock = threading.Lock()
-_thread = None
+_threads = {}
 
 
 # ---------------------------------------------------------------------------
@@ -91,9 +93,13 @@ def load_index(index_csv):
 # ---------------------------------------------------------------------------
 # Synchronous backfill
 # ---------------------------------------------------------------------------
-def backfill(data_dir=None, index_csv=None, dry_run=False, create_schema=None,
+def backfill(data_dir=None, index_csv=None, furnace_id=None, dry_run=False, create_schema=None,
              skip_heat_ids=(), emit=None):
     """Load every CSV heat into SQL Server. Returns a summary dict.
+
+    furnace_id: which furnace these CSVs belong to (e.g. "4/1" or "4/2").
+    Defaults to config.FURNACE_ID for backward compatibility with callers
+    that only ever dealt with one furnace.
 
     skip_heat_ids: heats to leave alone - used to keep a heat that is
     running *right now* from having its live IN_PROGRESS row overwritten
@@ -103,6 +109,7 @@ def backfill(data_dir=None, index_csv=None, dry_run=False, create_schema=None,
     """
     data_dir = data_dir or config.DATA_DIR
     index_csv = index_csv or config.INDEX_CSV
+    furnace_id = furnace_id or config.FURNACE_ID
     create_schema = config.SQL_AUTO_CREATE_SCHEMA if create_schema is None else create_schema
     emit = emit or logger.info
 
@@ -114,6 +121,7 @@ def backfill(data_dir=None, index_csv=None, dry_run=False, create_schema=None,
     result = {
         "state": "running",
         "dry_run": dry_run,
+        "furnace_id": furnace_id,
         "heats_seen": len(index),
         "files_seen": len(heat_files),
         "heats_written": 0,
@@ -124,7 +132,7 @@ def backfill(data_dir=None, index_csv=None, dry_run=False, create_schema=None,
     }
 
     emit(f"Backfill: {len(index)} indexed heat(s), {len(heat_files)} heat file(s) "
-         f"-> {config.SQL_SERVER}/{config.SQL_DATABASE} (FurnaceId={config.FURNACE_ID})"
+         f"-> {config.SQL_SERVER}/{config.SQL_DATABASE} (FurnaceId={furnace_id})"
          f"{' [DRY RUN]' if dry_run else ''}")
 
     if not index and not heat_files:
@@ -161,8 +169,8 @@ def backfill(data_dir=None, index_csv=None, dry_run=False, create_schema=None,
                 emit(f"  {heat_id}  {status:<12} start={start} end={end} tilts={tilts}")
             else:
                 cursor.execute(db.SQL_UPSERT_HEAT_END,
-                               config.FURNACE_ID, end, duration, tilts, status, heat_id,
-                               heat_id, config.FURNACE_ID, number, start, end, duration,
+                               furnace_id, end, duration, tilts, status, heat_id,
+                               heat_id, furnace_id, number, start, end, duration,
                                tilts, status, csv_file, host)
             result["heats_written"] += 1
 
@@ -181,8 +189,8 @@ def backfill(data_dir=None, index_csv=None, dry_run=False, create_schema=None,
             # analysis view can join to it.
             if heat_id not in index and not dry_run:
                 cursor.execute(db.SQL_UPSERT_HEAT_START,
-                               config.FURNACE_ID, number, None, os.path.basename(path), host, heat_id,
-                               heat_id, config.FURNACE_ID, number, None, os.path.basename(path), host)
+                               furnace_id, number, None, os.path.basename(path), host, heat_id,
+                               heat_id, furnace_id, number, None, os.path.basename(path), host)
 
             with open(path, newline="") as f:
                 rows = list(csv.DictReader(f))
@@ -206,7 +214,7 @@ def backfill(data_dir=None, index_csv=None, dry_run=False, create_schema=None,
                                    # UPDATE
                                    start, end, duration, tilt_number, note, host, key,
                                    # INSERT
-                                   key, heat_id, config.FURNACE_ID, number, name,
+                                   key, heat_id, furnace_id, number, name,
                                    start, end, duration, tilt_number, note, host)
                 result["events_written"] += 1
 
@@ -253,18 +261,23 @@ def backfill(data_dir=None, index_csv=None, dry_run=False, create_schema=None,
 # ---------------------------------------------------------------------------
 # Background thread
 # ---------------------------------------------------------------------------
-def status():
-    """Snapshot of the background backfill, for the status API."""
+def status(key=None):
+    """Snapshot of the background backfill, for the status API.
+
+    key: furnace slug (e.g. "4-1"). Omit to get a dict of every furnace's
+    status keyed by slug (used by a combined status view)."""
     with _lock:
-        return dict(_last_result)
+        if key is None:
+            return {k: dict(v) for k, v in _last_results.items()}
+        return dict(_last_results.get(key, {"state": "not_started"}))
 
 
-def _set_status(**kw):
+def _set_status(key, **kw):
     with _lock:
-        _last_result.update(kw)
+        _last_results.setdefault(key, {}).update(kw)
 
 
-def _worker(data_dir, index_csv, state_machine, max_attempts, retry_seconds):
+def _worker(key, data_dir, index_csv, furnace_id, state_machine, max_attempts, retry_seconds):
     # A heat that is live right now must not be overwritten by the stale
     # CSV row for it; the recorder owns that row until the heat completes.
     skip = set()
@@ -273,53 +286,60 @@ def _worker(data_dir, index_csv, state_machine, max_attempts, retry_seconds):
 
     delay = retry_seconds
     for attempt in range(1, max_attempts + 1):
-        _set_status(state="running", attempt=attempt)
+        _set_status(key, state="running", attempt=attempt)
         try:
-            result = backfill(data_dir=data_dir, index_csv=index_csv, skip_heat_ids=skip)
+            result = backfill(data_dir=data_dir, index_csv=index_csv,
+                              furnace_id=furnace_id, skip_heat_ids=skip)
             result["attempt"] = attempt
-            _set_status(**result)
+            _set_status(key, **result)
             return
         except Exception as exc:
-            _set_status(state="retrying", attempt=attempt, error=str(exc)[:500])
+            _set_status(key, state="retrying", attempt=attempt, error=str(exc)[:500])
             if attempt == max_attempts:
                 logger.warning(
-                    "Backfill gave up after %d attempt(s): %s. "
+                    "Backfill for %s gave up after %d attempt(s): %s. "
                     "Live heats are still being recorded (and spooled if the "
-                    "database is down); run `python3 migrate_csv_to_sql.py` "
-                    "once it's reachable to load the history.", attempt, exc)
-                _set_status(state="failed")
+                    "database is down); run `python3 migrate_csv_to_sql.py "
+                    "--furnace-id %s` once it's reachable to load the history.",
+                    key, attempt, exc, furnace_id)
+                _set_status(key, state="failed")
                 return
-            logger.info("Backfill attempt %d failed, retrying in %ss", attempt, delay)
+            logger.info("Backfill for %s attempt %d failed, retrying in %ss", key, attempt, delay)
             time.sleep(delay)
             delay = min(delay * 2, config.SQL_RETRY_MAX_SECONDS)
 
 
-def start_background_backfill(data_dir=None, index_csv=None, state_machine=None,
-                              max_attempts=5, retry_seconds=None):
+def start_background_backfill(key, data_dir=None, index_csv=None, furnace_id=None,
+                              state_machine=None, max_attempts=5, retry_seconds=None):
     """Kick the CSV backfill off on its own daemon thread and return
     immediately. Never raises - a database problem here must not stop the
-    dashboard or the camera from starting."""
-    global _thread
+    dashboard or the camera from starting.
 
+    key: furnace slug (e.g. "4-1", "4-2") - keeps this furnace's thread and
+    status separate from any other furnace backfilling at the same time."""
     if not config.SQL_ENABLED:
-        _set_status(state="disabled")
+        _set_status(key, state="disabled")
         return None
     if not config.SQL_BACKFILL_ON_START:
-        _set_status(state="skipped")
+        _set_status(key, state="skipped")
         return None
-    if _thread is not None and _thread.is_alive():
-        return _thread
+    existing = _threads.get(key)
+    if existing is not None and existing.is_alive():
+        return existing
 
-    _thread = threading.Thread(
+    thread = threading.Thread(
         target=_worker,
-        args=(data_dir or config.DATA_DIR,
+        args=(key,
+              data_dir or config.DATA_DIR,
               index_csv or config.INDEX_CSV,
+              furnace_id,
               state_machine,
               max_attempts,
               retry_seconds or config.SQL_RETRY_MIN_SECONDS),
-        name="SqlBackfill",
+        name=f"SqlBackfill-{key}",
         daemon=True,
     )
-    _thread.start()
-    logger.info("CSV -> SQL backfill started in background thread.")
-    return _thread
+    _threads[key] = thread
+    thread.start()
+    logger.info("CSV -> SQL backfill started in background thread for %s.", key)
+    return thread

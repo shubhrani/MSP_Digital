@@ -149,7 +149,7 @@ class HeatStateMachine:
     EXPECTED_DURATION_MIN = EXPECTED_DURATION_MIN
 
     def __init__(self, data_dir="data/heats", index_csv="data/heats_index.csv",
-                 recorder=None):
+                 recorder=None, furnace_id=None, heat_id_prefix="Heat"):
         self.data_dir = data_dir
         self.index_csv = index_csv
         # Optional db.SqlRecorder. It only ever puts a dict on a queue, so
@@ -157,6 +157,18 @@ class HeatStateMachine:
         # camera thread no matter what the database is doing. Leave it as
         # None and the class behaves exactly as it did before: CSV only.
         self.recorder = recorder
+
+        # Tags every row this instance sends to the recorder (see _notify).
+        # Left as None by default so old callers/tests see the exact same
+        # behavior as before (db.py falls back to config.FURNACE_ID itself).
+        self.furnace_id = furnace_id
+
+        # Prefix used when minting heat IDs (e.g. "Heat" -> "Heat_003_...").
+        # Two furnaces sharing one SQL Heats table must never produce the
+        # same HeatId (it's the primary key), so each furnace instance is
+        # given a distinct prefix. Must not contain "_" - heat_id is split
+        # on "_" elsewhere to recover the numeric heat number.
+        self.heat_id_prefix = heat_id_prefix
         os.makedirs(self.data_dir, exist_ok=True)
         index_parent = os.path.dirname(self.index_csv)
         if index_parent:
@@ -327,7 +339,7 @@ class HeatStateMachine:
         skip straight to that stage instead, logging the earlier stage(s) as
         unknown-duration rather than guessing a start time for them."""
         self.heat_number += 1
-        self.heat_id = f"Heat_{self.heat_number:03d}_{timestamp.strftime('%Y%m%d_%H%M%S')}"
+        self.heat_id = f"{self.heat_id_prefix}_{self.heat_number:03d}_{timestamp.strftime('%Y%m%d_%H%M%S')}"
         self.heat_csv_path = os.path.join(self.data_dir, f"{self.heat_id}.csv")
         with open(self.heat_csv_path, "w", newline="") as f:
             csv.writer(f).writerow(CSV_HEADERS)
@@ -499,6 +511,8 @@ class HeatStateMachine:
         """
         if self.recorder is None:
             return
+        if self.furnace_id is not None:
+            kwargs.setdefault("furnace_id", self.furnace_id)
         try:
             getattr(self.recorder, method)(**kwargs)
         except Exception:

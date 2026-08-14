@@ -458,10 +458,12 @@ class SqlRecorder:
     # -----------------------------------------------------------------
     # Public recording API (called from the camera thread - must be fast)
     # -----------------------------------------------------------------
-    def record_heat_started(self, heat_id, heat_number, start_time, csv_file=None):
+    def record_heat_started(self, heat_id, heat_number, start_time, csv_file=None,
+                            furnace_id=None):
         self._enqueue({
             "op": "heat_start",
             "heat_id": heat_id,
+            "furnace_id": furnace_id,
             "heat_number": heat_number,
             "start_time": _iso(start_time),
             "csv_file": csv_file,
@@ -469,10 +471,11 @@ class SqlRecorder:
 
     def record_heat_completed(self, heat_id, heat_number, start_time, end_time,
                               duration_minutes, tilt_count, status="COMPLETE",
-                              csv_file=None):
+                              csv_file=None, furnace_id=None):
         self._enqueue({
             "op": "heat_end",
             "heat_id": heat_id,
+            "furnace_id": furnace_id,
             "heat_number": heat_number,
             "start_time": _iso(start_time),
             "end_time": _iso(end_time),
@@ -484,7 +487,7 @@ class SqlRecorder:
 
     def record_event(self, heat_id, heat_number, event_name, start_time, end_time,
                      duration_minutes=None, tilt_number=None, note=None,
-                     ordinal=None, event_key=None):
+                     ordinal=None, event_key=None, furnace_id=None):
         if event_key is None:
             event_key = (make_event_key(heat_id, ordinal, event_name)
                          if ordinal is not None else str(uuid.uuid4()))
@@ -492,6 +495,7 @@ class SqlRecorder:
             "op": "event",
             "event_key": event_key,
             "heat_id": heat_id,
+            "furnace_id": furnace_id,
             "heat_number": heat_number,
             "event_name": event_name,
             "start_time": _iso(start_time),

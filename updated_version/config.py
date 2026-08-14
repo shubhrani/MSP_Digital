@@ -10,6 +10,9 @@ import os
 # Camera / stream
 # ---------------------------------------------------------------------------
 # Example: "rtsp://user:password@192.168.1.64:554/Streaming/Channels/101"
+# Kept for backward compatibility with anything that still imports
+# config.RTSP_URL directly (tests, one-off scripts). The running app itself
+# reads the per-furnace URL out of FURNACES below.
 RTSP_URL = "rtsp://admin:Admin@1234@10.50.40.152:554/video/live?channel=1&subtype=0"
 
 # If the RTSP connection drops, wait this many seconds before retrying.
@@ -38,23 +41,75 @@ DEBOUNCE_FRAMES = 5
 JPEG_QUALITY = 80
 
 # ---------------------------------------------------------------------------
-# Furnace identity
+# Furnaces
 # ---------------------------------------------------------------------------
-# Which physical furnace this deployment is watching. Every row this
-# instance writes to SQL Server (Heats + HeatEvents) is tagged with this
-# value, so multiple furnaces can share one database/table set and still
-# be filtered/reported on independently (WHERE FurnaceId = '4/2').
+# This one Flask app now watches BOTH furnace cameras at once, each on its
+# own dashboard page (/furnace/4-1 and /furnace/4-2), each with its own
+# CameraWorker + HeatStateMachine + CSV files. Both push into the SAME
+# SQL Server database/tables (Heats, HeatEvents); every row is tagged with
+# FurnaceId so the two furnaces stay segregated there too
+# (WHERE FurnaceId = '4/1' vs '4/2').
 #
-# Override per-machine with an environment variable so the same codebase
-# can be copied to the 4/1 deployment later without editing this file:
-#     export FURNACE_ID="4/1"
-FURNACE_ID = os.getenv("FURNACE_ID", "4/2")
+# Each entry:
+#   furnace_id     - value stored in the SQL FurnaceId column / shown in UI
+#   name            - display name on the dashboard
+#   rtsp_url        - that furnace's camera stream
+#   data_dir        - where that furnace's per-heat CSVs live
+#   index_csv       - that furnace's heat-history summary CSV
+#   heat_id_prefix  - prefix used when generating heat IDs (e.g. "Heat_003_...").
+#                      Two furnaces must never generate the same HeatId, since
+#                      it's the primary key in the shared Heats table - hence
+#                      the different prefix per furnace. IMPORTANT: keep this
+#                      prefix free of underscores (it's split on "_" to parse
+#                      the heat number back out).
+#
+# 4/2 keeps the exact same data_dir/index_csv/prefix ("data/heats",
+# "data/heats_index.csv", "Heat") it already uses today, so this update
+# doesn't touch or renumber the heat history already on disk / in SQL for
+# that furnace. 4/1 is a fresh deployment with its own files.
+#
+# Every value can be overridden by an environment variable, so the same zip
+# can be copied between machines without editing this file - e.g. if a
+# camera's IP or credentials change:
+#     export FURNACE_4_1_RTSP="rtsp://user:pass@10.50.40.151:554/..."
+#     export FURNACE_4_2_RTSP="rtsp://user:pass@10.50.40.152:554/..."
+FURNACES = {
+    "4-1": {
+        "furnace_id": "4/1",
+        "name": "Furnace 4/1",
+        "rtsp_url": os.getenv(
+            "FURNACE_4_1_RTSP",
+            "rtsp://admin:Admin@1234@10.50.40.151:554/video/live?channel=1&subtype=0",
+        ),
+        "data_dir": os.getenv("FURNACE_4_1_DATA_DIR", "data/heats_4_1"),
+        "index_csv": os.getenv("FURNACE_4_1_INDEX_CSV", "data/heats_index_4_1.csv"),
+        "heat_id_prefix": "Heat41",
+    },
+    "4-2": {
+        "furnace_id": "4/2",
+        "name": "Furnace 4/2",
+        "rtsp_url": os.getenv("FURNACE_4_2_RTSP", "rtsp://admin:Admin@1234@10.50.40.152:554/video/live?channel=1&subtype=0"),
+        "data_dir": os.getenv("FURNACE_4_2_DATA_DIR", "data/heats"),
+        "index_csv": os.getenv("FURNACE_4_2_INDEX_CSV", "data/heats_index.csv"),
+        "heat_id_prefix": "Heat",
+    },
+}
+
+# Which furnace page "/" redirects to.
+DEFAULT_FURNACE_SLUG = "4-2"
+
+# Kept for backward compatibility with scripts (check_sql.py, migrate_csv_to_sql.py
+# when run without --furnace-id, tests) that only ever cared about one furnace.
+FURNACE_ID = os.getenv("FURNACE_ID", FURNACES["4-2"]["furnace_id"])
 
 # ---------------------------------------------------------------------------
 # Data storage
 # ---------------------------------------------------------------------------
-DATA_DIR = "data/heats"                       # one CSV per heat lives here
-INDEX_CSV = "data/heats_index.csv"            # summary row per heat
+# Legacy single-furnace defaults - still used by anything that imports these
+# directly (tests, migrate_csv_to_sql.py's argparse defaults). The running
+# app itself uses each furnace's own data_dir/index_csv from FURNACES above.
+DATA_DIR = FURNACES["4-2"]["data_dir"]        # one CSV per heat lives here
+INDEX_CSV = FURNACES["4-2"]["index_csv"]      # summary row per heat
 
 # ---------------------------------------------------------------------------
 # SQL Server

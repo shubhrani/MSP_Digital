@@ -3,21 +3,29 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Furnace Process Monitor</title>
+<title>{{ furnace_name }} &middot; Process Monitor</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Oswald:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&family=Inter:wght@400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
 </head>
-<body>
+<body data-furnace-slug="{{ furnace_slug }}">
 
 <header class="topbar">
   <div class="topbar__brand">
     <span class="topbar__mark">FE</span>
     <div class="topbar__title">
-      <h1>Furnace Process Monitor</h1>
+      <h1>{{ furnace_name }} Process Monitor</h1>
       <p>Scrap &middot; Sponge &middot; Tap &mdash; live cycle tracking</p>
     </div>
   </div>
+
+  <nav class="furnace-nav">
+    {% for f in nav_furnaces %}
+    <a class="furnace-nav__link{% if f.slug == furnace_slug %} is-active{% endif %}"
+       href="{{ url_for('dashboard', slug=f.slug) }}">{{ f.name }}</a>
+    {% endfor %}
+  </nav>
+
   <div class="topbar__status">
     <div class="pill" id="camera-pill">
       <span class="pill__dot" id="camera-dot"></span>
@@ -34,7 +42,7 @@
       <div class="video-frame__label">
         <span class="live-dot"></span> LIVE
       </div>
-      <img id="video" src="{{ url_for('video_feed') }}" alt="Furnace camera feed">
+      <img id="video" src="{{ url_for('video_feed', slug=furnace_slug) }}" alt="{{ furnace_name }} camera feed">
     </div>
 
     <!-- Signature element: the heat process line -->
@@ -79,7 +87,7 @@
   <aside class="side-column">
 
     <div class="card heat-card">
-      <div class="card__eyebrow">Current heat</div>
+      <div class="card__eyebrow">Current heat &middot; {{ furnace_name }}</div>
       <div class="heat-card__id" id="heat-id">&mdash;</div>
       <div class="heat-card__stage" id="heat-stage">IDLE</div>
     </div>

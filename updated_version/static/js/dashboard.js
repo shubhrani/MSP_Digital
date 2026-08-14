@@ -1,6 +1,9 @@
 /* Furnace Process Monitor - dashboard polling & rendering.
  * No build step, no frameworks: plain fetch + DOM updates. */
 
+const FURNACE_SLUG = document.body.dataset.furnaceSlug;
+const API_BASE = `/furnace/${FURNACE_SLUG}`;
+
 const STATUS_POLL_MS = 2000;
 const HISTORY_POLL_MS = 8000;
 const TICK_MS = 1000;
@@ -142,14 +145,14 @@ function renderHistory(rows) {
       const start = r.start_time ? new Date(r.start_time) : null;
       const startText = start ? start.toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "—";
       const dur = r.duration_minutes ? `${Math.round(parseFloat(r.duration_minutes))}m` : "—";
-      const shortId = (r.heat_id || "").replace(/^Heat_/, "#");
+      const shortId = (r.heat_id || "").replace(/^[A-Za-z]+_/, "#");
       return `<tr>
         <td>${shortId}</td>
         <td>${startText}</td>
         <td>${dur}</td>
         <td>${r.tilt_count || 0}</td>
         <td>${statusChipHTML(r.status)}</td>
-        <td><a href="/api/heats/${encodeURIComponent(r.heat_id)}/csv" download>CSV</a></td>
+        <td><a href="${API_BASE}/api/heats/${encodeURIComponent(r.heat_id)}/csv" download>CSV</a></td>
       </tr>`;
     })
     .join("");
@@ -157,7 +160,7 @@ function renderHistory(rows) {
 
 async function pollStatus() {
   try {
-    const res = await fetch("/api/status");
+    const res = await fetch(`${API_BASE}/api/status`);
     if (res.ok) renderStatus(await res.json());
   } catch (err) {
     console.error("Status poll failed", err);
@@ -166,7 +169,7 @@ async function pollStatus() {
 
 async function pollHistory() {
   try {
-    const res = await fetch("/api/heats");
+    const res = await fetch(`${API_BASE}/api/heats`);
     if (res.ok) renderHistory(await res.json());
   } catch (err) {
     console.error("History poll failed", err);
