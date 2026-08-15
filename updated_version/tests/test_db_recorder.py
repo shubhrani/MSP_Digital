@@ -36,6 +36,20 @@ def t(minutes_offset):
     return BASE + datetime.timedelta(minutes=minutes_offset)
 
 
+def hb(sm, minutes_offset):
+    """Simulates the camera worker's continuous per-frame activefire
+    heartbeat (see test_state_machine.py's copy of this helper for why a
+    debounce edge alone isn't enough to keep the watchdog clock alive)."""
+    sm.note_activefire_seen(t(minutes_offset))
+
+
+def keep_alive(sm, start, end, step=8):
+    m = start
+    while m < end:
+        hb(sm, m)
+        m += step
+
+
 def fresh_tmp():
     shutil.rmtree(TMP_DIR, ignore_errors=True)
     os.makedirs(TMP_DIR, exist_ok=True)
@@ -58,6 +72,9 @@ class RecordingRecorder:
 
     def record_event(self, **kw):
         self.calls.append(("event", kw))
+
+    def record_heat_deleted(self, **kw):
+        self.calls.append(("heat_delete", kw))
 
     def of(self, kind):
         return [kw for k, kw in self.calls if k == kind]
@@ -137,10 +154,14 @@ def test_state_machine_feeds_the_recorder():
                           recorder=rec)
 
     sm.process_detections({3}, t(0))            # heat starts
+    keep_alive(sm, 8, 25)
     sm.process_detections({8}, t(25))           # scrap -> sponge
+    keep_alive(sm, 33, 70)
     sm.process_detections({12}, t(70))          # tilt begins (< 130 min sponge)
     sm.process_detections({2}, t(71))           # tilt resolves, counted
+    keep_alive(sm, 79, 160)
     sm.process_detections({12}, t(160))         # >= 130 min sponge -> tapping starts
+    keep_alive(sm, 168, 175)
     sm.process_detections({2}, t(175))          # furnace back to normal -> tapping ends
 
     starts = rec.of("heat_start")
@@ -184,10 +205,42 @@ def test_no_recorder_is_csv_only():
     sm = HeatStateMachine(data_dir=os.path.join(TMP_DIR, "heats"),
                           index_csv=os.path.join(TMP_DIR, "heats_index.csv"))
     sm.process_detections({3}, t(0))
+    heat_id = sm.heat_id
+    keep_alive(sm, 8, 25)
     sm.process_detections({8}, t(25))
     assert sm.recorder is None
+    assert sm.heat_id == heat_id, "heat should still be the one started at t(0)"
+    assert sm.state == sm.STATE_SPONGE_CHARGING
     assert os.path.exists(sm.get_heat_csv_path(sm.heat_id))
     print("test_no_recorder_is_csv_only passed.")
+
+
+def test_activefire_watchdog_notifies_recorder():
+    """When the active-fire watchdog wipes a heat, the recorder should get
+    a record_heat_deleted() call for it (in addition to the CSV file and
+    index row actually disappearing on disk)."""
+    fresh_tmp()
+    rec = RecordingRecorder()
+    sm = HeatStateMachine(data_dir=os.path.join(TMP_DIR, "heats"),
+                          index_csv=os.path.join(TMP_DIR, "heats_index.csv"),
+                          recorder=rec, furnace_id="4/2")
+
+    sm.process_detections({3}, t(0))            # heat starts, no class 9 ever
+    heat_id = sm.heat_id
+    csv_path = sm.get_heat_csv_path(heat_id)
+    assert os.path.exists(csv_path)
+
+    sm.check_timeouts(t(10.5))                  # past the 10-minute timeout
+
+    assert sm.state == sm.STATE_IDLE
+    assert not os.path.exists(csv_path)
+
+    deletes = rec.of("heat_delete")
+    assert len(deletes) == 1, deletes
+    assert deletes[0]["heat_id"] == heat_id
+    assert deletes[0]["furnace_id"] == "4/2"
+
+    print("test_activefire_watchdog_notifies_recorder passed.")
 
 
 def test_deterministic_event_keys():
@@ -281,15 +334,50 @@ def test_writes_go_straight_through_when_healthy():
     print("test_writes_go_straight_through_when_healthy passed.")
 
 
+def test_heat_delete_op_removes_both_tables():
+    """record_heat_deleted() should issue a DELETE against HeatEvents and
+    another against Heats for that HeatId - events first, since Heats is
+    the logical parent."""
+    fresh_tmp()
+    registry = install_fake_pyodbc()
+    spool = os.path.join(TMP_DIR, "spool3.jsonl")
+
+    recorder = db.SqlRecorder(enabled=True, spool_file=spool)
+    recorder.start()
+    recorder.record_heat_deleted("Heat_099_no_fire", furnace_id="4/2")
+
+    deadline = time.time() + 10
+    while time.time() < deadline and recorder.status()["rows_written"] < 1:
+        time.sleep(0.05)
+
+    status = recorder.status()
+    assert status["rows_written"] == 1, status
+    assert status["spooled"] == 0
+    assert status["last_error"] is None
+
+    deletes = [(sql, params) for sql, params in registry["executed"] if sql.startswith("DELETE")]
+    assert len(deletes) == 2, deletes
+    # Events table deleted before the Heats table (see the comment in db.py).
+    assert "HeatEvents" in deletes[0][0], deletes[0]
+    assert "Heats" in deletes[1][0] and "HeatEvents" not in deletes[1][0], deletes[1]
+    assert deletes[0][1] == ("Heat_099_no_fire",)
+    assert deletes[1][1] == ("Heat_099_no_fire",)
+
+    recorder.stop(timeout=5)
+    print("test_heat_delete_op_removes_both_tables passed.")
+
+
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     _real_pyodbc = db.pyodbc
     try:
         test_state_machine_feeds_the_recorder()
         test_no_recorder_is_csv_only()
+        test_activefire_watchdog_notifies_recorder()
         test_deterministic_event_keys()
         test_spool_and_replay()
         test_writes_go_straight_through_when_healthy()
+        test_heat_delete_op_removes_both_tables()
     finally:
         db.pyodbc = _real_pyodbc
         shutil.rmtree(TMP_DIR, ignore_errors=True)

@@ -15,6 +15,7 @@ import cv2
 import config
 from debounce import ClassDebouncer
 from detector import FurnaceDetector, draw_detections, draw_status_overlay
+from state_machine import CLS_FURNACE_ACTIVEFIRE
 
 logger = logging.getLogger(__name__)
 
@@ -92,13 +93,23 @@ class CameraWorker(threading.Thread):
                     newly_confirmed, _ = self.debouncer.update(detected_ids)
                     if newly_confirmed:
                         self.state_machine.process_detections(newly_confirmed, datetime.datetime.now())
+                    # Heartbeat for the active-fire watchdog: a debounce
+                    # edge only fires once per confirm/lose streak, which
+                    # isn't enough to keep a multi-minute watchdog clock
+                    # alive while class 9 stays confirmed the whole time -
+                    # so this checks its *current* confirmed status, every
+                    # processed frame, regardless of whether it's new.
+                    if self.debouncer.is_confirmed(CLS_FURNACE_ACTIVEFIRE):
+                        self.state_machine.note_activefire_seen(datetime.datetime.now())
                 except Exception:
                     logger.exception("Detection failed on this frame, showing raw video for it")
 
-            # Purely time-based transitions (the 15-minute tapping timer)
-            # don't depend on any detection, so give them a chance to fire
-            # on every frame - this way a heat still closes out on time
-            # even during a stretch with no new class detections.
+            # Purely time-based transitions (the 15-minute tapping timer,
+            # the 1.9-minute tilt -> tapping promotion, the active-fire
+            # watchdog) don't depend on any detection, so give them a
+            # chance to fire on every frame - this way a heat still closes
+            # out (or gets cleaned up) on time even during a stretch with
+            # no new class detections at all.
             self.state_machine.check_timeouts(datetime.datetime.now())
 
             annotated = frame

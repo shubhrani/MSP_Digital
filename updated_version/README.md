@@ -188,6 +188,35 @@ once tapping is confirmed (either the under-130-min or the fast-track
 way), class 2/12/13/16/18 no longer drive any transition &mdash; only the
 timer and class 3 close out the heat.
 
+### Tilt held open too long -> tapping
+
+On top of the 130-minute fast track above, a tilt being *watched* (see
+the table above) is promoted straight into tapping if it's been open for
+more than **1.9 minutes** &mdash; whether or not class 2 ever confirms it
+was "just a tilt". This is a pure time check (`TILT_TO_TAPPING_MINUTES`
+in `state_machine.py`), so it fires purely from elapsed time even if no
+further detection ever arrives for that furnace movement. Tapping is
+backdated to the moment the tilt itself began, matching how the
+130-minute fast track backdates sponge charging's end.
+
+### Active-fire watchdog (class 9, `furnace_operation_activefire`)
+
+If a heat is in progress (any stage) and class 9 hasn't been confirmed
+for **10 minutes** (`ACTIVEFIRE_TIMEOUT_MINUTES`) &mdash; counting from
+the heat's own start if it's never been seen at all &mdash; the app
+assumes the camera lost the fire (or the furnace isn't actually running)
+and deletes that heat entirely: the SQL `Heats`/`HeatEvents` rows, the
+per-heat CSV file, and its row in `heats_index.csv`. The app then drops
+back to `IDLE`, ready for the next heat, and the next detection starts a
+brand new one (heat numbers aren't reused, so the deleted heat leaves a
+gap rather than a duplicate).
+
+**Note:** this currently watches the whole heat, including scrap
+charging. If scrap charging (or some other stage) can legitimately run
+for more than 10 minutes with no class-9 sighting on camera, every heat
+will get wiped during that stage &mdash; tell me and this can be scoped to
+start only once sponge charging begins instead.
+
 ### Assumptions I made where the spec was open-ended
 
 - **Tilt/tap watching only starts during sponge charging**, and the

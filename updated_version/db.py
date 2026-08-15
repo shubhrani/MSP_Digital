@@ -485,6 +485,17 @@ class SqlRecorder:
             "csv_file": csv_file,
         })
 
+    def record_heat_deleted(self, heat_id, furnace_id=None):
+        """Wipe a heat entirely: its Heats row and every HeatEvents row for
+        it. Used by the active-fire watchdog (state_machine.py) when a heat
+        has been running with no confirmed activefire for too long and is
+        treated as invalid rather than a real heat."""
+        self._enqueue({
+            "op": "heat_delete",
+            "heat_id": heat_id,
+            "furnace_id": furnace_id,
+        })
+
     def record_event(self, heat_id, heat_number, event_name, start_time, end_time,
                      duration_minutes=None, tilt_number=None, note=None,
                      ordinal=None, event_key=None, furnace_id=None):
@@ -621,6 +632,14 @@ class SqlRecorder:
                                # INSERT
                                key, payload["heat_id"], furnace_id, number, payload["event_name"],
                                start, end, duration, tilt_number, note, host)
+
+            elif op == "heat_delete":
+                heat_id = payload["heat_id"]
+                # HeatEvents first: it has a logical (unenforced) FK to
+                # Heats, and deleting the parent row first would just leave
+                # its child rows orphaned instead of gone.
+                cursor.execute(f"DELETE FROM {EVENTS} WHERE HeatId = ?", heat_id)
+                cursor.execute(f"DELETE FROM {HEATS} WHERE HeatId = ?", heat_id)
 
             else:
                 logger.warning("Ignoring unknown SQL payload op: %r", op)

@@ -58,6 +58,34 @@ Logic (matches the classes to their numeric IDs, not their text names):
       scrap charging has begun, so a new heat starts immediately from this
       same moment).
 
+  Tilt duration -> tapping promotion (on top of the two rules above):
+  While the app is "watching" a tilt (see 12 above, under-130-minute case),
+  if the furnace stays out of the normal position for more than
+  TILT_TO_TAPPING_MINUTES (1.9 min) *without* class 2 ever confirming it
+  was just a tilt, the watch is promoted straight into tapping - same as
+  the 130-minute fast track, just triggered by how long this one tilt has
+  run instead of by total sponge-charging time. This is a pure time-based
+  check (see check_timeouts / _check_timeouts_locked below), so it fires
+  even if no further detection ever arrives for that furnace movement.
+
+  Active-fire watchdog (independent of the above):
+  9  furnace_operation_activefire  -> heartbeat only; doesn't drive any
+                                       stage transition by itself, but each
+                                       confirmed sighting resets a clock
+                                       for whatever heat is currently in
+                                       progress (see note_activefire_seen).
+  If a heat is in progress (any of SCRAP_CHARGING / SPONGE_CHARGING /
+  TAPPING) and class 9 hasn't been confirmed for ACTIVEFIRE_TIMEOUT_MINUTES
+  (10 min) - counting from the heat's own start if it's never been seen at
+  all yet - the heat is treated as invalid (camera lost the fire / furnace
+  isn't actually running) and every trace of it is deleted: the SQL Heats
+  + HeatEvents rows, the per-heat CSV file, and its row in the index CSV.
+  The app then drops straight back to IDLE, ready for the next heat.
+  NOTE: this watches the *whole* heat, including scrap charging. If your
+  furnace can legitimately run some stage for more than 10 minutes with no
+  class-9 sighting on camera, that stage's heats will get wiped - tell me
+  and this can be scoped to only start once sponge charging begins.
+
 Assumptions made explicit (see README for more):
   - Tilt/tap watching only kicks in while sponge charging is the active
     stage, matching the described scrap -> sponge -> tapping flow.
@@ -89,6 +117,7 @@ logger = logging.getLogger(__name__)
 CLS_FURNACE_NORMAL = 2
 CLS_MAGNET_FEEDING_SCRAP = 3
 CLS_SPONGE_FEEDER_ON_FURNACE = 8
+CLS_FURNACE_ACTIVEFIRE = 9
 CLS_FURNACE_TILTING = 12
 
 # Classes the state machine actually reacts to. Passed to the debouncer so
@@ -97,6 +126,7 @@ RELEVANT_CLASS_IDS = {
     CLS_FURNACE_NORMAL,
     CLS_MAGNET_FEEDING_SCRAP,
     CLS_SPONGE_FEEDER_ON_FURNACE,
+    CLS_FURNACE_ACTIVEFIRE,
     CLS_FURNACE_TILTING,
 }
 
@@ -137,6 +167,19 @@ EXPECTED_DURATION_MIN = {
 # ---------------------------------------------------------------------------
 SPONGE_FAST_TRACK_MINUTES = 130
 SPONGE_FAST_TRACK_THRESHOLD = datetime.timedelta(minutes=SPONGE_FAST_TRACK_MINUTES)
+
+# A tilt that's still open (furnace hasn't returned to "normal") after this
+# long is no longer treated as a quick inspection tilt - it's promoted
+# straight into tapping, whether or not class 2 ever confirms it.
+TILT_TO_TAPPING_MINUTES = 1.9
+TILT_TO_TAPPING_THRESHOLD = datetime.timedelta(minutes=TILT_TO_TAPPING_MINUTES)
+
+# If a heat is in progress and class 9 (furnace_operation_activefire) hasn't
+# been confirmed for this long, the heat is deleted (SQL + CSV) and the app
+# returns to IDLE. See the module docstring for the important caveat about
+# this covering the whole heat, including scrap charging.
+ACTIVEFIRE_TIMEOUT_MINUTES = 10
+ACTIVEFIRE_TIMEOUT = datetime.timedelta(minutes=ACTIVEFIRE_TIMEOUT_MINUTES)
 
 
 class HeatStateMachine:
@@ -201,6 +244,12 @@ class HeatStateMachine:
         self.furnace_watch_active = False
         self.furnace_watch_start = None
 
+        # Last time class 9 (furnace_operation_activefire) was confirmed,
+        # for whatever heat is currently in progress. Reset to the heat's
+        # own start time each time a new heat begins - see the module
+        # docstring for the active-fire watchdog this feeds.
+        self.last_activefire_at = None
+
         self.completed_events = []
         self.last_event_desc = "Waiting for scrap charging to begin..."
         self.last_updated = None
@@ -215,10 +264,18 @@ class HeatStateMachine:
         newly_confirmed_ids = set(newly_confirmed_ids) if newly_confirmed_ids else set()
 
         with self._lock:
-            # Time-based transitions (the 15-minute tapping timer) get a
+            # An activefire sighting updates the watchdog clock before the
+            # timeout check below runs, so a call that both confirms class 9
+            # *and* would otherwise be past the timeout doesn't get treated
+            # as stale - if we can see fire right now, the heat is fine.
+            if CLS_FURNACE_ACTIVEFIRE in newly_confirmed_ids:
+                self.last_activefire_at = timestamp
+
+            # Time-based transitions (the 15-minute tapping timer, the tilt
+            # duration -> tapping promotion, the active-fire watchdog) get a
             # chance to fire first, using this call's timestamp as "now".
             # That keeps ordering correct if, say, a magnet_feeding_scrap
-            # detection and the timer both would have fired by now.
+            # detection and a timer both would have fired by now.
             self._check_timeouts_locked(timestamp)
 
             if not newly_confirmed_ids:
@@ -271,7 +328,25 @@ class HeatStateMachine:
             self.last_updated = timestamp
 
     def check_timeouts(self, timestamp=None):
-        pass
+        """Give purely time-based transitions a chance to fire even when no
+        new detection has come in. Safe (and meant) to call on every frame,
+        e.g. from the camera loop - process_detections() also runs the same
+        check on every call it makes, so nothing is missed either way."""
+        timestamp = timestamp or datetime.datetime.now()
+        with self._lock:
+            self._check_timeouts_locked(timestamp)
+
+    def note_activefire_seen(self, timestamp=None):
+        """Called whenever class 9 (furnace_operation_activefire) is
+        currently confirmed - every processed frame it's visible on, not
+        just the one frame it first became confirmed. A debounced class
+        only shows up in process_detections() once per confirm/lose edge,
+        which is fine for triggering a stage change but not enough to keep
+        a multi-minute watchdog clock alive while the fire stays visible
+        the whole time, so the camera worker calls this directly instead."""
+        timestamp = timestamp or datetime.datetime.now()
+        with self._lock:
+            self.last_activefire_at = timestamp
 
     def get_status(self):
         with self._lock:
@@ -298,6 +373,8 @@ class HeatStateMachine:
                 "elapsed_seconds": elapsed,
                 "tilt_count": self.tilt_count,
                 "furnace_watch_active": self.furnace_watch_active,
+                "last_activefire_at": self.last_activefire_at.isoformat() if self.last_activefire_at else None,
+                "activefire_timeout_minutes": ACTIVEFIRE_TIMEOUT_MINUTES,
                 "last_event": self.last_event_desc,
                 "events": list(self.completed_events),
                 "expected_duration_min": self.EXPECTED_DURATION_MIN,
@@ -330,7 +407,81 @@ class HeatStateMachine:
     # Internal transition handlers
     # -----------------------------------------------------------------
     def _check_timeouts_locked(self, timestamp):
-        pass
+        """Caller must already hold self._lock."""
+        # Tilt held open too long: no class 2 has confirmed it was "just a
+        # tilt" within TILT_TO_TAPPING_MINUTES, so treat it as tapping
+        # having started back when the tilt itself started.
+        if (self.state == self.STATE_SPONGE_CHARGING
+                and self.furnace_watch_active
+                and self.furnace_watch_start is not None
+                and (timestamp - self.furnace_watch_start) >= TILT_TO_TAPPING_THRESHOLD):
+            self._enter_tapping(
+                self.furnace_watch_start, self.furnace_watch_start,
+                note=f"tilt held past {TILT_TO_TAPPING_MINUTES} min, treated as tapping",
+            )
+
+        # Active-fire watchdog: a heat is running but class 9 hasn't been
+        # confirmed for ACTIVEFIRE_TIMEOUT_MINUTES (counting from the last
+        # confirmed sighting, or from the heat's own start if it's never
+        # been seen at all) -> the heat is invalid, wipe it.
+        if self.state != self.STATE_IDLE and self.heat_id is not None:
+            baseline = self.last_activefire_at or self.heat_start
+            if baseline is not None and (timestamp - baseline) >= ACTIVEFIRE_TIMEOUT:
+                self._abort_heat_no_activefire(timestamp)
+
+    def _abort_heat_no_activefire(self, timestamp):
+        """Class 9 hasn't been seen for ACTIVEFIRE_TIMEOUT while this heat
+        was in progress. Delete every trace of it - the SQL Heats/HeatEvents
+        rows, the per-heat CSV, and its row in the index CSV - so a later
+        CSV->SQL backfill can't resurrect it, then drop back to IDLE."""
+        heat_id = self.heat_id
+        heat_csv_path = self.heat_csv_path
+        since = self.last_activefire_at or self.heat_start
+        minutes_since = (round((timestamp - since).total_seconds() / 60.0, 2)
+                         if since else None)
+
+        logger.warning(
+            "%s: no furnace_operation_activefire confirmed for %s min while "
+            "%s was in progress - deleting this heat's data (SQL + CSV) and "
+            "returning to IDLE.",
+            heat_id, minutes_since, self.state,
+        )
+
+        # SQL: fire-and-forget, same as every other recorder call - see
+        # _notify(). Deletes both the Heats row and every HeatEvents row.
+        self._notify("record_heat_deleted", heat_id=heat_id)
+
+        # CSV: remove the per-heat file and its row in the index so a
+        # future backfill (which just walks these files) has nothing left
+        # to re-insert for this heat.
+        try:
+            if heat_csv_path and os.path.exists(heat_csv_path):
+                os.remove(heat_csv_path)
+        except OSError:
+            logger.exception("Could not remove heat CSV %s", heat_csv_path)
+        self._remove_index_row(heat_id)
+
+        # Back to a clean slate - the next detection starts a brand new
+        # heat. heat_number is deliberately left as-is (not decremented):
+        # the deleted heat still leaves a gap rather than having its number
+        # reused within the same run.
+        self.heat_id = None
+        self.heat_csv_path = None
+        self.heat_start = None
+        self._event_ordinal = 0
+        self.scrap_start = None
+        self.sponge_start = None
+        self.tapping_start = None
+        self.tilt_count = 0
+        self.furnace_watch_active = False
+        self.furnace_watch_start = None
+        self.completed_events = []
+        self.last_activefire_at = None
+        self.state = self.STATE_IDLE
+        self.last_event_desc = (
+            f"{heat_id}: no active fire detected for {ACTIVEFIRE_TIMEOUT_MINUTES} min - "
+            "heat data deleted"
+        )
 
     def _start_new_heat(self, timestamp, mid_process_stage=None):
         """Starts a new heat. Normally this begins at scrap charging; if
@@ -352,6 +503,9 @@ class HeatStateMachine:
         self.tilt_count = 0
         self.furnace_watch_active = False
         self.completed_events = []
+        # Fresh watchdog clock for this heat - see the active-fire watchdog
+        # in the module docstring / _check_timeouts_locked.
+        self.last_activefire_at = timestamp
         self.state = self.STATE_SCRAP_CHARGING
         self.last_event_desc = f"{self.heat_id}: scrap charging started"
 
@@ -556,6 +710,21 @@ class HeatStateMachine:
                 row[3] = duration
                 row[4] = tilt_count
                 row[5] = status
+
+        with open(self.index_csv, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(header)
+            writer.writerows(rows)
+
+    def _remove_index_row(self, heat_id):
+        """Drop heat_id's row from the index CSV entirely (used when a heat
+        is deleted, as opposed to _update_index_row which just edits it)."""
+        if not os.path.exists(self.index_csv):
+            return
+        with open(self.index_csv, "r", newline="") as f:
+            reader = csv.reader(f)
+            header = next(reader)
+            rows = [row for row in reader if row and row[0] != heat_id]
 
         with open(self.index_csv, "w", newline="") as f:
             writer = csv.writer(f)
