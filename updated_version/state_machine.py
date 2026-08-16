@@ -178,7 +178,7 @@ TILT_TO_TAPPING_THRESHOLD = datetime.timedelta(minutes=TILT_TO_TAPPING_MINUTES)
 # been confirmed for this long, the heat is deleted (SQL + CSV) and the app
 # returns to IDLE. See the module docstring for the important caveat about
 # this covering the whole heat, including scrap charging.
-ACTIVEFIRE_TIMEOUT_MINUTES = 10
+ACTIVEFIRE_TIMEOUT_MINUTES = 50
 ACTIVEFIRE_TIMEOUT = datetime.timedelta(minutes=ACTIVEFIRE_TIMEOUT_MINUTES)
 
 
@@ -424,10 +424,12 @@ class HeatStateMachine:
         # confirmed for ACTIVEFIRE_TIMEOUT_MINUTES (counting from the last
         # confirmed sighting, or from the heat's own start if it's never
         # been seen at all) -> the heat is invalid, wipe it.
-        if self.state != self.STATE_IDLE and self.heat_id is not None:
-            baseline = self.last_activefire_at or self.heat_start
-            if baseline is not None and (timestamp - baseline) >= ACTIVEFIRE_TIMEOUT:
-                self._abort_heat_no_activefire(timestamp)
+        # Temporarily restrict this logic to furnace 4/2 only.
+        if self.furnace_id == "4/2":
+            if self.state != self.STATE_IDLE and self.heat_id is not None:
+                baseline = self.last_activefire_at or self.heat_start
+                if baseline is not None and (timestamp - baseline) >= ACTIVEFIRE_TIMEOUT:
+                    self._abort_heat_no_activefire(timestamp)
 
     def _abort_heat_no_activefire(self, timestamp):
         """Class 9 hasn't been seen for ACTIVEFIRE_TIMEOUT while this heat

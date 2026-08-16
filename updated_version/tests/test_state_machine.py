@@ -236,7 +236,7 @@ def test_heat_deleted_after_activefire_timeout():
     """If class 9 is never (re)confirmed for ACTIVEFIRE_TIMEOUT_MINUTES
     while a heat is running, the heat's CSV file and its row in the index
     CSV are both deleted and the state machine drops back to IDLE."""
-    sm = fresh_machine()
+    sm = fresh_machine(furnace_id="4/2")
 
     sm.process_detections({3}, t(0))
     heat_id = sm.heat_id
@@ -245,19 +245,19 @@ def test_heat_deleted_after_activefire_timeout():
     assert heat_id in {r["heat_id"] for r in sm.get_heats_history()}
 
     # No class 9 at all. Just under the timeout, the heat is still there.
-    sm.check_timeouts(t(9))
+    sm.check_timeouts(t(49))
     assert sm.state == sm.STATE_SCRAP_CHARGING
     assert sm.heat_id == heat_id
 
     # Past the timeout: the heat is wiped - CSV file, index row, and all.
-    sm.check_timeouts(t(10.5))
+    sm.check_timeouts(t(50.5))
     assert sm.state == sm.STATE_IDLE
     assert sm.heat_id is None
     assert not os.path.exists(csv_path)
     assert heat_id not in {r["heat_id"] for r in sm.get_heats_history()}
 
     # A fresh detection starts a brand new heat, unaffected by the deleted one.
-    sm.process_detections({3}, t(20))
+    sm.process_detections({3}, t(60))
     assert sm.state == sm.STATE_SCRAP_CHARGING
     assert sm.heat_id != heat_id
 
@@ -267,20 +267,20 @@ def test_heat_deleted_after_activefire_timeout():
 def test_activefire_seen_partway_through_resets_the_clock():
     """A late but in-time class 9 sighting resets the watchdog clock, so a
     heat that would otherwise be right on the edge survives."""
-    sm = fresh_machine()
+    sm = fresh_machine(furnace_id="4/2")
 
     sm.process_detections({3}, t(0))
     heat_id = sm.heat_id
 
-    sm.check_timeouts(t(9))                     # still fine, under 10 min
+    sm.check_timeouts(t(49))                     # still fine, under 50 min
     assert sm.heat_id == heat_id
 
-    sm.process_detections({9}, t(9.5))           # activefire confirmed - clock resets
-    sm.check_timeouts(t(18))                     # 8.5 min after the sighting: fine
+    sm.process_detections({9}, t(49.5))           # activefire confirmed - clock resets
+    sm.check_timeouts(t(98))                     # 48.5 min after the sighting: fine
     assert sm.heat_id == heat_id
     assert sm.state == sm.STATE_SCRAP_CHARGING
 
-    sm.check_timeouts(t(20))                     # 10.5 min after the sighting: wiped
+    sm.check_timeouts(t(100))                     # 50.5 min after the sighting: wiped
     assert sm.state == sm.STATE_IDLE
     assert sm.heat_id is None
 
