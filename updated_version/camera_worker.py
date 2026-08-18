@@ -14,8 +14,13 @@ import cv2
 
 import config
 from debounce import ClassDebouncer
-from detector import FurnaceDetector, draw_detections, draw_status_overlay
-from state_machine import CLS_FURNACE_ACTIVEFIRE
+from detector import FurnaceDetector, draw_detections, draw_status_overlay, magnet_above_furnace_normal
+from state_machine import (
+    CLS_FURNACE_ACTIVEFIRE,
+    CLS_FURNACE_NORMAL,
+    CLS_MAGNET_ABOVE_FURNACE,
+    CLS_MAGNET_MOVING_WITHSCRAP,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +97,18 @@ class CameraWorker(threading.Thread):
                     # Matched by class NAME, not numeric ID - see
                     # state_machine.RELEVANT_CLASS_NAMES / CLS_* constants.
                     detected_names = {d["name"] for d in detections}
+
+                    # Derived signal: magnet_moving_withscrap positioned
+                    # just above furnace_position_normal in this same
+                    # frame - not a class the model predicts on its own, so
+                    # it's computed here from the raw boxes and fed into
+                    # the debouncer/state machine exactly like any other
+                    # confirmed class name (see
+                    # config.MAGNET_ABOVE_FURNACE_* and
+                    # detector.magnet_above_furnace_normal()).
+                    if magnet_above_furnace_normal(detections, CLS_MAGNET_MOVING_WITHSCRAP, CLS_FURNACE_NORMAL):
+                        detected_names.add(CLS_MAGNET_ABOVE_FURNACE)
+
                     newly_confirmed, _ = self.debouncer.update(detected_names)
                     if newly_confirmed:
                         self.state_machine.process_detections(newly_confirmed, datetime.datetime.now())

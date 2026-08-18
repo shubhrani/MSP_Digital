@@ -234,26 +234,34 @@ PROCESS_CLASSES = {
     # moment.
     "scrap_charging_start": "magnet_feeding_scrap",
 
+    # Second, independent way to (re)confirm scrap charging is underway:
+    # magnet_moving_withscrap detected with its box positioned just above
+    # furnace_position_normal's box (see MAGNET_ABOVE_FURNACE_* below for
+    # the spatial thresholds). This is a *derived* signal - camera_worker.py
+    # computes it from the two raw boxes each frame and feeds it into the
+    # state machine exactly like any other confirmed class name, under this
+    # name. It is not a class the model itself predicts.
+    "scrap_charging_magnet_alt": "magnet_moving_withscrap_above_furnace_normal",
+
     # Detected while SCRAP_CHARGING -> scrap charging ends, sponge charging
-    # starts.
+    # starts. Either of these two classes is enough.
     "sponge_charging_start": "spange_feeder_onfurnace",
+    "sponge_charging_start_alt": "spange_feeder_engaged",
 
     # Furnace back in its normal resting position. Ends TAPPING; also
-    # resolves an open tilt watch (either of the two below) back into
-    # "that was just a tilt, not tapping".
+    # resolves an open tilt watch back into "that was just a tilt, not
+    # tapping".
     "furnace_normal": "furnace_position_normal",
 
-    # Furnace visibly leaving the normal position - one of two independent
-    # tilt/tapping signals watched during sponge charging (see
-    # TILT_TO_TAPPING_MINUTES below for its own promote-to-tapping timer).
+    # Furnace visibly leaving the normal position - the tilt/tapping signal
+    # watched during sponge charging (see TILT_TO_TAPPING_MINUTES below for
+    # its own promote-to-tapping timer).
     "furnace_tilting": "furnace_position_tilding",
 
-    # Furnace visibly "up" - the second, independent tilt/tapping signal
-    # watched during sponge charging (see FURNACE_UP_TO_TILT_SECONDS /
-    # FURNACE_UP_TO_TAPPING_MINUTES below for its own timers). If both this
-    # and furnace_tilting fire for the same movement, furnace_tilting takes
-    # priority and only one tilt/tapping is counted for it.
-    "furnace_up": "furnace_position_up",
+    # Furnace bottom fully visible -> tapping has definitely started,
+    # regardless of how long sponge charging has run or whether a tilt was
+    # ever watched for this movement.
+    "furnace_tapping_bottom_visible": "furnace_bottom_visiblecompletely",
 
     # Heartbeat only - every confirmed sighting resets the active-fire
     # watchdog clock for whatever heat is currently in progress. Doesn't
@@ -264,28 +272,46 @@ PROCESS_CLASSES = {
 # ---------------------------------------------------------------------------
 # Process logic - timings
 # ---------------------------------------------------------------------------
-# Sponge charging running this long or more -> the first tilt/up signal
-# seen is immediately taken as tapping starting (no need to also confirm
-# via a return to "normal" first, unlike the normal under-threshold path).
+# Scrap charging cannot run longer than this, full stop: if no
+# sponge_charging_start signal has arrived by the time this many minutes
+# have elapsed, the state machine forces the transition into sponge
+# charging anyway (logged with a note), rather than letting scrap charging
+# run indefinitely.
+SCRAP_CHARGING_MAX_MINUTES = 40
+
+# Sponge charging cannot run longer than this, full stop: if tapping hasn't
+# started by the time this many minutes have elapsed, the state machine
+# forces the transition into tapping anyway (logged with a note).
+SPONGE_CHARGING_MAX_MINUTES = 140
+
+# Sponge charging running this long or more -> the first tilt signal seen
+# is immediately taken as tapping starting (no need to also confirm via a
+# return to "normal" first, unlike the normal under-threshold path).
 SPONGE_FAST_TRACK_MINUTES = 130
 
 # furnace_tilting held open this long without furnace_normal confirming it
 # was "just a tilt" -> promoted straight into tapping, backdated to when
 # the tilt itself began.
-TILT_TO_TAPPING_MINUTES = 1.9
-
-# furnace_up held for at least this long, then furnace_normal -> counts as
-# a tilt (tilt_count += 1). Anything shorter is treated as a brief flicker
-# and not counted at all. Set to 0 to count every furnace_up sighting
-# regardless of how brief.
-FURNACE_UP_TO_TILT_SECONDS = 25
-
-# furnace_up held open this long without furnace_normal ever arriving ->
-# treated as tapping having started (mirrors TILT_TO_TAPPING_MINUTES above,
-# but for the furnace_up signal instead of furnace_tilting).
-FURNACE_UP_TO_TAPPING_MINUTES = 2
+TILT_TO_TAPPING_MINUTES = 2.5
 
 # If a heat is in progress and furnace_activefire hasn't been confirmed for
 # this many minutes, the heat is treated as invalid (camera lost the fire /
 # furnace isn't actually running) and every trace of it is deleted.
 ACTIVEFIRE_TIMEOUT_MINUTES = 50
+
+# ---------------------------------------------------------------------------
+# Process logic - magnet_moving_withscrap "just above" furnace_position_normal
+# ---------------------------------------------------------------------------
+# Used to derive the scrap_charging_magnet_alt signal above from the two raw
+# boxes (magnet_moving_withscrap and furnace_position_normal) on the same
+# frame - see camera_worker.py's _magnet_above_furnace_normal().
+#
+# "Just above" is treated as: the magnet's box sits above the furnace's box
+# (its bottom edge is at or above the furnace box's top edge) by no more
+# than this many pixels of vertical gap...
+MAGNET_ABOVE_FURNACE_MAX_GAP_PX = 80
+
+# ...AND the two boxes overlap horizontally by at least this fraction of the
+# narrower box's width (so a magnet box off to the side, merely at a similar
+# height, doesn't count).
+MAGNET_ABOVE_FURNACE_MIN_OVERLAP_RATIO = 0.15
