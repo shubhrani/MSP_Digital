@@ -35,7 +35,7 @@ class CameraWorker(threading.Thread):
 
         self.debouncer = ClassDebouncer(
             confirm_frames=config.DEBOUNCE_FRAMES,
-            class_ids=state_machine.RELEVANT_CLASS_IDS,
+            class_ids=state_machine.RELEVANT_CLASS_NAMES,
         )
 
         # A Condition (rather than a plain Lock + polling) lets frames()
@@ -89,8 +89,10 @@ class CameraWorker(threading.Thread):
                 try:
                     detections = self.detector.detect(frame)
                     self._last_detections = detections
-                    detected_ids = {d["class_id"] for d in detections}
-                    newly_confirmed, _ = self.debouncer.update(detected_ids)
+                    # Matched by class NAME, not numeric ID - see
+                    # state_machine.RELEVANT_CLASS_NAMES / CLS_* constants.
+                    detected_names = {d["name"] for d in detections}
+                    newly_confirmed, _ = self.debouncer.update(detected_names)
                     if newly_confirmed:
                         self.state_machine.process_detections(newly_confirmed, datetime.datetime.now())
                     # Heartbeat for the active-fire watchdog: a debounce
@@ -115,7 +117,7 @@ class CameraWorker(threading.Thread):
             annotated = frame
             if self.detector is not None:
                 annotated = draw_detections(frame, self._last_detections,
-                                             self.state_machine.RELEVANT_CLASS_IDS)
+                                             self.state_machine.RELEVANT_CLASS_NAMES)
             annotated = draw_status_overlay(annotated, self.state_machine.get_status_lines())
 
             ok, jpeg = cv2.imencode(".jpg", annotated, [int(cv2.IMWRITE_JPEG_QUALITY), config.JPEG_QUALITY])

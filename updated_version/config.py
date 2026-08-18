@@ -167,37 +167,125 @@ FLASK_PORT = 8000
 FLASK_DEBUG = False
 
 # ---------------------------------------------------------------------------
-# Class map (as provided). Used only for drawing labels if the weights file
-# does not carry its own names. The state-machine logic matches on the
-# numeric class IDs below, not on these strings, so it keeps working even
-# if your model's label text differs slightly.
+# Class map (as provided by the updated model export). Maps the model's
+# numeric class IDs to their string names. This is only used as a fallback
+# to translate a raw numeric class_id into its name for a model that
+# doesn't embed its own names in the weights file - detector.py prefers the
+# names embedded in the weights file (self.model.names) when present.
+#
+# IMPORTANT: state_machine.py matches on these NAME strings, not on the
+# numeric IDs below, so the process logic keeps working even if the model
+# is retrained and its classes get renumbered again in future, as long as
+# the class *names* themselves don't change. If a retrain DOES change a
+# class's name (not just its number), update the matching entry in
+# PROCESS_CLASSES below to point at the new name - nothing else needs to
+# change.
 # ---------------------------------------------------------------------------
 CLASS_NAMES = {
-    0: "negitive_sample_notvisible",
-    1: "spange_feeder_farfromfurnace",
-    2: "furnace_position_normal",
-    3: "magnet_feeding_scrap",
-    4: "magnet_moving_ideal",
-    5: "negitive_sample_sunlight",
-    6: "negitive_sample_fan",
-    7: "negitive_sample_otherfurnaces",
-    8: "spange_feeder_onfurnace",
-    9: "furnace_operation_activefire",
-    10: "negetive_sample_craenbeem",
-    11: "negative_sample_scraponground",
-    12: "furnace_position_tilding",
-    13: "furnace_bottom_visiblepartially",
-    14: "negitive_sample_pillers",
-    15: "negative_sample_furnacesmoke",
-    16: "furnace_bottom_visiblecompletely",
-    17: "magnet_moving_withscrap",
-    18: "furnace_position_up",
-    19: "laddle_moving_empty",
-    20: "negative_sample_slab",
-    21: "scrap_mettal_onground",
-    22: "negetive_sample_crainbeem",
-    23: "spange_feeder_engaged",
+    0: "negitive_sample_otherfurnaces",
+    1: "negitive_sample_pillers",
+    2: "negetive_sample_craenbeem",
+    3: "spange_feeder_farfromfurnace",
+    4: "furnace_bottom_visiblepartially",
+    5: "furnace_position_up",
+    6: "negative_sample_scraponground",
+    7: "spange_feeder_engaged",
+    8: "furnace_operation_activefire",
+    9: "furnace_position_normal",
+    10: "spange_feeder_onfurnace",
+    11: "scrap_mettal_onground",
+    12: "negetive_sample_crainbeem",
+    13: "negitive_sample_sunlight",
+    14: "negitive_sample_fan",
+    15: "magnet_moving_ideal",
+    16: "magnet_moving_withscrap",
+    17: "sponge_feeder_farfromfurnace",
+    18: "sponge_feeder_notengaged",
+    19: "magnet_feeding_scrap",
+    20: "furnace_position_tilding",
+    21: "negative_sample_slab",
+    22: "negitive_sample_notvisible",
+    23: "laddle_moving_empty",
     24: "spange_feeder_notengaged",
-    25: "magnet_moving_slab",
-    26: "laddle_moving_withmeltiron",
+    25: "negative_sample_furnacesmoke",
+    26: "furnace_bottom_visiblecompletely",
+    27: "laddle_moving_withmeltiron",
+    28: "magnet_moving_slab",
+    29: "furnace_operation_scrapfeeding",
 }
+
+# ---------------------------------------------------------------------------
+# Process logic - which class NAME drives which step
+# ---------------------------------------------------------------------------
+# This is the single place that wires a class name to a role in the heat
+# cycle (scrap charging -> sponge charging -> tapping). state_machine.py
+# imports this dict and matches on names only - it never hardcodes a class
+# string itself. So if the model is retrained and a class gets a new name
+# (or you simply want a different signal to drive a step), change the
+# value here and nothing else in the codebase needs to be touched.
+#
+# Every value must be one of the names in CLASS_NAMES above (or, in
+# production, one of the names the model weights themselves embed - see
+# detector.py, which prefers those over CLASS_NAMES).
+PROCESS_CLASSES = {
+    # Detected while IDLE -> a new heat begins and the scrap-charging clock
+    # starts. If this fires while the *previous* heat is still in TAPPING,
+    # that heat is closed out first and the new heat starts from this same
+    # moment.
+    "scrap_charging_start": "magnet_feeding_scrap",
+
+    # Detected while SCRAP_CHARGING -> scrap charging ends, sponge charging
+    # starts.
+    "sponge_charging_start": "spange_feeder_onfurnace",
+
+    # Furnace back in its normal resting position. Ends TAPPING; also
+    # resolves an open tilt watch (either of the two below) back into
+    # "that was just a tilt, not tapping".
+    "furnace_normal": "furnace_position_normal",
+
+    # Furnace visibly leaving the normal position - one of two independent
+    # tilt/tapping signals watched during sponge charging (see
+    # TILT_TO_TAPPING_MINUTES below for its own promote-to-tapping timer).
+    "furnace_tilting": "furnace_position_tilding",
+
+    # Furnace visibly "up" - the second, independent tilt/tapping signal
+    # watched during sponge charging (see FURNACE_UP_TO_TILT_SECONDS /
+    # FURNACE_UP_TO_TAPPING_MINUTES below for its own timers). If both this
+    # and furnace_tilting fire for the same movement, furnace_tilting takes
+    # priority and only one tilt/tapping is counted for it.
+    "furnace_up": "furnace_position_up",
+
+    # Heartbeat only - every confirmed sighting resets the active-fire
+    # watchdog clock for whatever heat is currently in progress. Doesn't
+    # drive a stage transition on its own.
+    "furnace_activefire": "furnace_operation_activefire",
+}
+
+# ---------------------------------------------------------------------------
+# Process logic - timings
+# ---------------------------------------------------------------------------
+# Sponge charging running this long or more -> the first tilt/up signal
+# seen is immediately taken as tapping starting (no need to also confirm
+# via a return to "normal" first, unlike the normal under-threshold path).
+SPONGE_FAST_TRACK_MINUTES = 130
+
+# furnace_tilting held open this long without furnace_normal confirming it
+# was "just a tilt" -> promoted straight into tapping, backdated to when
+# the tilt itself began.
+TILT_TO_TAPPING_MINUTES = 1.9
+
+# furnace_up held for at least this long, then furnace_normal -> counts as
+# a tilt (tilt_count += 1). Anything shorter is treated as a brief flicker
+# and not counted at all. Set to 0 to count every furnace_up sighting
+# regardless of how brief.
+FURNACE_UP_TO_TILT_SECONDS = 25
+
+# furnace_up held open this long without furnace_normal ever arriving ->
+# treated as tapping having started (mirrors TILT_TO_TAPPING_MINUTES above,
+# but for the furnace_up signal instead of furnace_tilting).
+FURNACE_UP_TO_TAPPING_MINUTES = 2
+
+# If a heat is in progress and furnace_activefire hasn't been confirmed for
+# this many minutes, the heat is treated as invalid (camera lost the fire /
+# furnace isn't actually running) and every trace of it is deleted.
+ACTIVEFIRE_TIMEOUT_MINUTES = 50

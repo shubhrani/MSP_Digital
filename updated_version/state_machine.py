@@ -1,96 +1,123 @@
 """
 HeatStateMachine
 ----------------
-Turns a stream of *confirmed* class-ID detections into the furnace process
+Turns a stream of *confirmed* class-name detections into the furnace process
 timeline described by the plant: scrap charging -> sponge charging ->
 tapping, plus a tilt counter for furnace movements that turn out NOT to be
 tapping.
 
-Logic (matches the classes to their numeric IDs, not their text names):
+Logic (matches the classes by their text names, not numeric IDs - see the
+CLS_* constants below for the exact strings used. Matching on names instead
+of numbers means this logic keeps working even if the model is retrained
+and its classes get renumbered, as long as the class *names* stay the same):
 
-  3  magnet_feeding_scrap        -> scrap charging starts (new heat begins).
-                                    If this is seen while the *previous*
-                                    heat is still in TAPPING, that heat is
-                                    closed out immediately (see "Ending a
-                                    heat" below) and the new heat starts
-                                    from this same moment.
-  8  spange_feeder_onfurnace     -> scrap charging ends, sponge charging starts
+  magnet_feeding_scrap        -> scrap charging starts (new heat begins).
+                                  If this is seen while the *previous* heat
+                                  is still in TAPPING, that heat is closed
+                                  out immediately (see "Ending a heat"
+                                  below) and the new heat starts from this
+                                  same moment.
+  spange_feeder_onfurnace     -> scrap charging ends, sponge charging starts
 
   Watching for tapping while sponge charging is in progress works in two
   different ways depending on how long sponge charging has already run:
 
   Under 130 minutes of sponge charging (the normal case):
-  12 furnace_position_tilding   -> furnace leaves "normal" position. We
-                                    don't yet know if this is the start of
-                                    tapping or just an inspection tilt, so
-                                    the app starts "watching".
-  2  furnace_position_normal     -> furnace is back to normal position
-                                    while being watched -> this was just a
-                                    tilt (not tapping). tilt_count += 1,
-                                    and the app keeps waiting inside sponge
-                                    charging.
+  furnace_position_tilding    -> furnace leaves "normal" position. We
+                                  don't yet know if this is the start of
+                                  tapping or just an inspection tilt, so
+                                  the app starts "watching".
+  furnace_position_normal     -> furnace is back to normal position while
+                                  being watched -> this was just a tilt
+                                  (not tapping). tilt_count += 1, and the
+                                  app keeps waiting inside sponge charging.
 
   From 130 minutes of sponge charging onward (fast-track):
-  12 furnace_position_tilding   -> at this point the plant is confident
-                                    this movement really is the start of
-                                    tapping, so it's taken as tapping
-                                    starting immediately - no need to also
-                                    see the furnace return to normal first.
-                                    Sponge charging is closed out and
-                                    tapping starts, both at this same
-                                    moment.
-  2  furnace_position_normal     -> (while TAPPING) tapping has ended and
-                                    the heat is complete.
+  furnace_position_tilding    -> at this point the plant is confident this
+                                  movement really is the start of tapping,
+                                  so it's taken as tapping starting
+                                  immediately - no need to also see the
+                                  furnace return to normal first. Sponge
+                                  charging is closed out and tapping
+                                  starts, both at this same moment.
+  furnace_position_normal     -> (while TAPPING) tapping has ended and the
+                                  heat is complete.
+
+  furnace_position_up -> tilt / tapping (mirrors furnace_position_tilding
+  above, on its own independent timers - see FURNACE_UP_TO_TILT_SECONDS and
+  FURNACE_UP_TO_TAPPING_MINUTES in config.py):
+    - furnace_position_up seen, then furnace_position_normal within
+      FURNACE_UP_TO_TAPPING_MINUTES (2 min by default) -> counts as a tilt
+      (tilt_count += 1), even if furnace_position_tilding itself was never
+      confirmed for that movement - as long as it was held at least
+      FURNACE_UP_TO_TILT_SECONDS (25 sec by default); anything briefer is
+      treated as a flicker and not counted at all.
+    - furnace_position_up still held (no furnace_position_normal) once
+      FURNACE_UP_TO_TAPPING_MINUTES has passed -> promoted straight into
+      tapping, the same way an over-long furnace_position_tilding watch is
+      (see the tilt-duration -> tapping-promotion note further below). This
+      is a pure time-based check, so it fires purely from check_timeouts()
+      even with no further detection ever arriving for that movement.
+  If both furnace_position_tilding and furnace_position_up were seen for
+  the same movement, only one tilt/tapping is counted for it (the tilding
+  path takes priority - see _resolve_furnace_watch / _resolve_furnace_up_watch
+  and _check_timeouts_locked).
 
   Starting mid-process (app restarted, or first launched, while a heat is
   already underway): if the first thing seen while IDLE is anything other
-  than 3 (magnet_feeding_scrap), a heat is assumed to already be in
-  progress and is picked up immediately from whichever stage that implies,
-  rather than sitting in IDLE waiting indefinitely for the next scrap
-  charging. See MID_PROCESS_SPONGE_CLASS_IDS / MID_PROCESS_TAPPING_CLASS_IDS
+  than magnet_feeding_scrap, a heat is assumed to already be in progress
+  and is picked up immediately from whichever stage that implies, rather
+  than sitting in IDLE waiting indefinitely for the next scrap charging.
+  See MID_PROCESS_SPONGE_CLASS_NAMES / MID_PROCESS_TAPPING_CLASS_NAMES
   below. The skipped earlier stage(s) are logged with an unknown start/
   duration instead of a guessed one.
 
   Ending a heat (tapping -> IDLE), whichever happens first:
-    - class 2 (furnace_position_normal) is detected while TAPPING, or
+    - furnace_position_normal is detected while TAPPING, or
     - 15 minutes have passed since tapping started, or
-    - 3 magnet_feeding_scrap is detected (this also means the *next* heat's
+    - magnet_feeding_scrap is detected (this also means the *next* heat's
       scrap charging has begun, so a new heat starts immediately from this
       same moment).
 
-  Tilt duration -> tapping promotion (on top of the two rules above):
-  While the app is "watching" a tilt (see 12 above, under-130-minute case),
-  if the furnace stays out of the normal position for more than
-  TILT_TO_TAPPING_MINUTES (1.9 min) *without* class 2 ever confirming it
-  was just a tilt, the watch is promoted straight into tapping - same as
-  the 130-minute fast track, just triggered by how long this one tilt has
-  run instead of by total sponge-charging time. This is a pure time-based
-  check (see check_timeouts / _check_timeouts_locked below), so it fires
-  even if no further detection ever arrives for that furnace movement.
+  Tilt duration -> tapping promotion (on top of the rules above):
+  While the app is "watching" a tilt (see furnace_position_tilding above,
+  under-130-minute case), if the furnace stays out of the normal position
+  for more than TILT_TO_TAPPING_MINUTES (1.9 min) *without*
+  furnace_position_normal ever confirming it was just a tilt, the watch is
+  promoted straight into tapping - same as the 130-minute fast track, just
+  triggered by how long this one tilt has run instead of by total
+  sponge-charging time. This is a pure time-based check (see check_timeouts
+  / _check_timeouts_locked below), so it fires even if no further
+  detection ever arrives for that furnace movement. (Note: this promotion
+  is only wired to the furnace_position_tilding watch, not to the
+  furnace_position_up watch - see the module note above.)
 
   Active-fire watchdog (independent of the above):
-  9  furnace_operation_activefire  -> heartbeat only; doesn't drive any
-                                       stage transition by itself, but each
-                                       confirmed sighting resets a clock
-                                       for whatever heat is currently in
-                                       progress (see note_activefire_seen).
+  furnace_operation_activefire  -> heartbeat only; doesn't drive any stage
+                                    transition by itself, but each
+                                    confirmed sighting resets a clock for
+                                    whatever heat is currently in progress
+                                    (see note_activefire_seen).
   If a heat is in progress (any of SCRAP_CHARGING / SPONGE_CHARGING /
-  TAPPING) and class 9 hasn't been confirmed for ACTIVEFIRE_TIMEOUT_MINUTES
-  (10 min) - counting from the heat's own start if it's never been seen at
-  all yet - the heat is treated as invalid (camera lost the fire / furnace
-  isn't actually running) and every trace of it is deleted: the SQL Heats
-  + HeatEvents rows, the per-heat CSV file, and its row in the index CSV.
-  The app then drops straight back to IDLE, ready for the next heat.
+  TAPPING) and furnace_operation_activefire hasn't been confirmed for
+  ACTIVEFIRE_TIMEOUT_MINUTES - counting from the heat's own start if it's
+  never been seen at all yet - the heat is treated as invalid (camera lost
+  the fire / furnace isn't actually running) and every trace of it is
+  deleted: the SQL Heats + HeatEvents rows, the per-heat CSV file, and its
+  row in the index CSV. The app then drops straight back to IDLE, ready
+  for the next heat.
   NOTE: this watches the *whole* heat, including scrap charging. If your
-  furnace can legitimately run some stage for more than 10 minutes with no
-  class-9 sighting on camera, that stage's heats will get wiped - tell me
-  and this can be scoped to only start once sponge charging begins.
+  furnace can legitimately run some stage for longer than
+  ACTIVEFIRE_TIMEOUT_MINUTES with no furnace_operation_activefire sighting
+  on camera, that stage's heats will get wiped - tell me and this can be
+  scoped to only start once sponge charging begins.
 
 Assumptions made explicit (see README for more):
   - Tilt/tap watching only kicks in while sponge charging is the active
     stage, matching the described scrap -> sponge -> tapping flow.
-  - Once tapping is confirmed (either way), only class 2 (to end it),
-    the 15-minute timer, and class 3 drive any further transition.
+  - Once tapping is confirmed (either way), only furnace_position_normal
+    (to end it), the 15-minute timer, and magnet_feeding_scrap drive any
+    further transition.
 
 Database: every stage (scrap/sponge/tapping) and every heat is pushed to
 the SQL recorder the moment it *starts* (see _notify_event_start /
@@ -109,46 +136,54 @@ import logging
 import os
 import threading
 
+import config
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Class IDs used by the logic
+# Classes used by the logic, matched by NAME (not numeric ID) - see the
+# module docstring above for why. Every name comes from config.PROCESS_CLASSES
+# - nothing here is hardcoded - so pointing any part of this logic at a
+# different class (new model, renamed class, or just a different desired
+# signal) is a one-line change in config.py, never in this file.
 # ---------------------------------------------------------------------------
-CLS_FURNACE_NORMAL = 2
-CLS_MAGNET_FEEDING_SCRAP = 3
-CLS_SPONGE_FEEDER_ON_FURNACE = 8
-CLS_FURNACE_ACTIVEFIRE = 9
-CLS_FURNACE_TILTING = 12
+CLS_FURNACE_ACTIVEFIRE = config.PROCESS_CLASSES["furnace_activefire"]
+CLS_FURNACE_NORMAL = config.PROCESS_CLASSES["furnace_normal"]
+CLS_MAGNET_FEEDING_SCRAP = config.PROCESS_CLASSES["scrap_charging_start"]
+CLS_FURNACE_TILTING = config.PROCESS_CLASSES["furnace_tilting"]
+CLS_FURNACE_UP = config.PROCESS_CLASSES["furnace_up"]
+CLS_SPONGE_FEEDER_ON_FURNACE = config.PROCESS_CLASSES["sponge_charging_start"]
 
 # Classes the state machine actually reacts to. Passed to the debouncer so
 # it only tracks streaks for classes that matter.
-RELEVANT_CLASS_IDS = {
+RELEVANT_CLASS_NAMES = {
     CLS_FURNACE_NORMAL,
     CLS_MAGNET_FEEDING_SCRAP,
     CLS_SPONGE_FEEDER_ON_FURNACE,
     CLS_FURNACE_ACTIVEFIRE,
     CLS_FURNACE_TILTING,
+    CLS_FURNACE_UP,
 }
 
 # ---------------------------------------------------------------------------
 # Mid-process start-up
 # ---------------------------------------------------------------------------
 # If the app is (re)started while a heat is already underway, we'd otherwise
-# sit in IDLE forever waiting for the next magnet_feeding_scrap (class 3),
+# sit in IDLE forever waiting for the next magnet_feeding_scrap,
 # missing the rest of the heat entirely. Instead, if the very first thing we
 # see while IDLE is one of the classes below, assume a heat is already in
 # progress and start tracking it immediately from whichever stage that class
 # implies - scrap charging's own start time is simply unknown/unlogged in
 # that case.
 #
-# 8 spange_feeder_onfurnace, or the furnace visibly moving
+# spange_feeder_onfurnace, or the furnace visibly moving
 # -> already in sponge charging (or a tilt inside it); jump straight there.
-MID_PROCESS_SPONGE_CLASS_IDS = {
+MID_PROCESS_SPONGE_CLASS_NAMES = {
     CLS_SPONGE_FEEDER_ON_FURNACE,
     CLS_FURNACE_TILTING,
 }
 # There's no longer a class that definitively indicates tapping on its own.
-MID_PROCESS_TAPPING_CLASS_IDS = set()
+MID_PROCESS_TAPPING_CLASS_NAMES = set()
 
 CSV_HEADERS = ["event", "start_time", "end_time", "duration_minutes", "tilt_number", "note"]
 INDEX_HEADERS = ["heat_id", "start_time", "end_time", "duration_minutes",
@@ -163,22 +198,38 @@ EXPECTED_DURATION_MIN = {
 }
 
 # ---------------------------------------------------------------------------
-# Tunable timing rules (see module docstring for what each one is for)
+# Tunable timing rules - every value comes from config.py (see module
+# docstring for what each one is for; see config.py for the actual numbers).
 # ---------------------------------------------------------------------------
-SPONGE_FAST_TRACK_MINUTES = 130
+SPONGE_FAST_TRACK_MINUTES = config.SPONGE_FAST_TRACK_MINUTES
 SPONGE_FAST_TRACK_THRESHOLD = datetime.timedelta(minutes=SPONGE_FAST_TRACK_MINUTES)
 
 # A tilt that's still open (furnace hasn't returned to "normal") after this
 # long is no longer treated as a quick inspection tilt - it's promoted
-# straight into tapping, whether or not class 2 ever confirms it.
-TILT_TO_TAPPING_MINUTES = 1.9
+# straight into tapping, whether or not furnace_position_normal ever confirms it.
+TILT_TO_TAPPING_MINUTES = config.TILT_TO_TAPPING_MINUTES
 TILT_TO_TAPPING_THRESHOLD = datetime.timedelta(minutes=TILT_TO_TAPPING_MINUTES)
 
-# If a heat is in progress and class 9 (furnace_operation_activefire) hasn't
+# furnace_position_up held for longer than this before furnace_position_normal
+# is detected also counts as a tilt (tilt_count += 1) - see the module
+# docstring's "furnace_position_up -> tilt counting" section above. A
+# furnace_position_up sighting that resolves to normal faster than this is
+# treated as a brief flicker, not a tilt.
+FURNACE_UP_TO_TILT_SECONDS = config.FURNACE_UP_TO_TILT_SECONDS
+FURNACE_UP_TO_TILT_THRESHOLD = datetime.timedelta(seconds=FURNACE_UP_TO_TILT_SECONDS)
+
+# furnace_position_up held open this long WITHOUT furnace_position_normal
+# ever arriving is promoted straight into tapping - the furnace_position_up
+# equivalent of TILT_TO_TAPPING_MINUTES above. See the module docstring's
+# "furnace_position_up -> tilt counting" section.
+FURNACE_UP_TO_TAPPING_MINUTES = config.FURNACE_UP_TO_TAPPING_MINUTES
+FURNACE_UP_TO_TAPPING_THRESHOLD = datetime.timedelta(minutes=FURNACE_UP_TO_TAPPING_MINUTES)
+
+# If a heat is in progress and furnace_operation_activefire hasn't
 # been confirmed for this long, the heat is deleted (SQL + CSV) and the app
 # returns to IDLE. See the module docstring for the important caveat about
 # this covering the whole heat, including scrap charging.
-ACTIVEFIRE_TIMEOUT_MINUTES = 50
+ACTIVEFIRE_TIMEOUT_MINUTES = config.ACTIVEFIRE_TIMEOUT_MINUTES
 ACTIVEFIRE_TIMEOUT = datetime.timedelta(minutes=ACTIVEFIRE_TIMEOUT_MINUTES)
 
 
@@ -188,7 +239,7 @@ class HeatStateMachine:
     STATE_SPONGE_CHARGING = "SPONGE_CHARGING"
     STATE_TAPPING = "TAPPING"
 
-    RELEVANT_CLASS_IDS = RELEVANT_CLASS_IDS
+    RELEVANT_CLASS_NAMES = RELEVANT_CLASS_NAMES
     EXPECTED_DURATION_MIN = EXPECTED_DURATION_MIN
 
     def __init__(self, data_dir="data/heats", index_csv="data/heats_index.csv",
@@ -244,7 +295,14 @@ class HeatStateMachine:
         self.furnace_watch_active = False
         self.furnace_watch_start = None
 
-        # Last time class 9 (furnace_operation_activefire) was confirmed,
+        # Same idea as furnace_watch_active/furnace_watch_start above, but
+        # for a furnace_position_up sighting instead of furnace_position_tilding -
+        # see the module docstring's "furnace_position_up -> tilt counting"
+        # section for what this drives.
+        self.furnace_up_watch_active = False
+        self.furnace_up_watch_start = None
+
+        # Last time furnace_operation_activefire was confirmed,
         # for whatever heat is currently in progress. Reset to the heat's
         # own start time each time a new heat begins - see the module
         # docstring for the active-fire watchdog this feeds.
@@ -265,7 +323,7 @@ class HeatStateMachine:
 
         with self._lock:
             # An activefire sighting updates the watchdog clock before the
-            # timeout check below runs, so a call that both confirms class 9
+            # timeout check below runs, so a call that both confirms furnace_operation_activefire
             # *and* would otherwise be past the timeout doesn't get treated
             # as stale - if we can see fire right now, the heat is fine.
             if CLS_FURNACE_ACTIVEFIRE in newly_confirmed_ids:
@@ -290,9 +348,9 @@ class HeatStateMachine:
             # normal transition logic below so that logic then runs
             # against the *new* state in this same call.
             if self.state == self.STATE_IDLE and CLS_MAGNET_FEEDING_SCRAP not in newly_confirmed_ids:
-                if newly_confirmed_ids & MID_PROCESS_TAPPING_CLASS_IDS:
+                if newly_confirmed_ids & MID_PROCESS_TAPPING_CLASS_NAMES:
                     self._start_new_heat(timestamp, mid_process_stage="tapping")
-                elif newly_confirmed_ids & MID_PROCESS_SPONGE_CLASS_IDS:
+                elif newly_confirmed_ids & MID_PROCESS_SPONGE_CLASS_NAMES:
                     self._start_new_heat(timestamp, mid_process_stage="sponge_charging")
 
             if CLS_MAGNET_FEEDING_SCRAP in newly_confirmed_ids:
@@ -322,8 +380,17 @@ class HeatStateMachine:
                     elif not self.furnace_watch_active:
                         self._begin_furnace_watch(timestamp)
 
-                if CLS_FURNACE_NORMAL in newly_confirmed_ids and self.furnace_watch_active:
-                    self._resolve_furnace_watch(timestamp)
+                if CLS_FURNACE_UP in newly_confirmed_ids and not self.furnace_up_watch_active:
+                    self._begin_furnace_up_watch(timestamp)
+
+                if CLS_FURNACE_NORMAL in newly_confirmed_ids:
+                    if self.furnace_watch_active:
+                        # Tilding path takes priority - also clears any
+                        # in-progress furnace_position_up watch for this
+                        # same movement so it isn't double-counted.
+                        self._resolve_furnace_watch(timestamp)
+                    elif self.furnace_up_watch_active:
+                        self._resolve_furnace_up_watch(timestamp)
 
             self.last_updated = timestamp
 
@@ -337,7 +404,7 @@ class HeatStateMachine:
             self._check_timeouts_locked(timestamp)
 
     def note_activefire_seen(self, timestamp=None):
-        """Called whenever class 9 (furnace_operation_activefire) is
+        """Called whenever furnace_operation_activefire is
         currently confirmed - every processed frame it's visible on, not
         just the one frame it first became confirmed. A debounced class
         only shows up in process_detections() once per confirm/lose edge,
@@ -373,6 +440,7 @@ class HeatStateMachine:
                 "elapsed_seconds": elapsed,
                 "tilt_count": self.tilt_count,
                 "furnace_watch_active": self.furnace_watch_active,
+                "furnace_up_watch_active": self.furnace_up_watch_active,
                 "last_activefire_at": self.last_activefire_at.isoformat() if self.last_activefire_at else None,
                 "activefire_timeout_minutes": ACTIVEFIRE_TIMEOUT_MINUTES,
                 "last_event": self.last_event_desc,
@@ -408,7 +476,7 @@ class HeatStateMachine:
     # -----------------------------------------------------------------
     def _check_timeouts_locked(self, timestamp):
         """Caller must already hold self._lock."""
-        # Tilt held open too long: no class 2 has confirmed it was "just a
+        # Tilt held open too long: no furnace_position_normal has confirmed it was "just a
         # tilt" within TILT_TO_TAPPING_MINUTES, so treat it as tapping
         # having started back when the tilt itself started.
         if (self.state == self.STATE_SPONGE_CHARGING
@@ -420,7 +488,24 @@ class HeatStateMachine:
                 note=f"tilt held past {TILT_TO_TAPPING_MINUTES} min, treated as tapping",
             )
 
-        # Active-fire watchdog: a heat is running but class 9 hasn't been
+        # Same idea, for a furnace_position_up sighting that never resolves
+        # back to furnace_position_normal: held open past
+        # FURNACE_UP_TO_TAPPING_MINUTES -> treated as tapping having started,
+        # backdated to when the furnace_position_up sighting itself began.
+        # If furnace_watch_active (tilding) is ALSO open for the same
+        # movement, that one is checked first above and _enter_tapping()
+        # clears both watches, so this simply won't have anything left to
+        # fire on for that movement - tilding keeps priority as elsewhere.
+        if (self.state == self.STATE_SPONGE_CHARGING
+                and self.furnace_up_watch_active
+                and self.furnace_up_watch_start is not None
+                and (timestamp - self.furnace_up_watch_start) >= FURNACE_UP_TO_TAPPING_THRESHOLD):
+            self._enter_tapping(
+                self.furnace_up_watch_start, self.furnace_up_watch_start,
+                note=f"furnace_position_up held past {FURNACE_UP_TO_TAPPING_MINUTES} min, treated as tapping",
+            )
+
+        # Active-fire watchdog: a heat is running but furnace_operation_activefire hasn't been
         # confirmed for ACTIVEFIRE_TIMEOUT_MINUTES (counting from the last
         # confirmed sighting, or from the heat's own start if it's never
         # been seen at all) -> the heat is invalid, wipe it.
@@ -477,6 +562,8 @@ class HeatStateMachine:
         self.tilt_count = 0
         self.furnace_watch_active = False
         self.furnace_watch_start = None
+        self.furnace_up_watch_active = False
+        self.furnace_up_watch_start = None
         self.completed_events = []
         self.last_activefire_at = None
         self.state = self.STATE_IDLE
@@ -504,6 +591,9 @@ class HeatStateMachine:
         self.tapping_start = None
         self.tilt_count = 0
         self.furnace_watch_active = False
+        self.furnace_watch_start = None
+        self.furnace_up_watch_active = False
+        self.furnace_up_watch_start = None
         self.completed_events = []
         # Fresh watchdog clock for this heat - see the active-fire watchdog
         # in the module docstring / _check_timeouts_locked.
@@ -555,6 +645,14 @@ class HeatStateMachine:
         self.furnace_watch_start = timestamp
         self.last_event_desc = f"{self.heat_id}: furnace left normal position, watching..."
 
+    def _begin_furnace_up_watch(self, timestamp):
+        """furnace_position_up newly confirmed - start timing it, same idea
+        as _begin_furnace_watch but for the furnace_position_up -> tilt
+        counting rule (see module docstring)."""
+        self.furnace_up_watch_active = True
+        self.furnace_up_watch_start = timestamp
+        self.last_event_desc = f"{self.heat_id}: furnace moved to up position, watching..."
+
     def _enter_tapping(self, tapping_start_time, sponge_end_time, note=""):
         """Closes out sponge charging and starts the tapping clock."""
         self._log_event("sponge_charging", self.sponge_start, sponge_end_time, note=note)
@@ -563,16 +661,23 @@ class HeatStateMachine:
 
         self.furnace_watch_active = False
         self.furnace_watch_start = None
+        self.furnace_up_watch_active = False
+        self.furnace_up_watch_start = None
 
         suffix = f" ({note})" if note else ""
         self.last_event_desc = f"{self.heat_id}: tapping started{suffix}"
         self._notify_event_start("tapping", tapping_start_time)
 
     def _resolve_furnace_watch(self, timestamp):
-        """Class 2 (furnace back to normal) seen while watching -> tilt completed."""
+        """furnace_position_normal seen while watching a furnace_position_tilding
+        sighting -> tilt completed."""
         watch_start = self.furnace_watch_start
         self.furnace_watch_active = False
         self.furnace_watch_start = None
+        # This same return-to-normal also resolves any furnace_position_up
+        # watch running for the same movement, so it isn't double-counted.
+        self.furnace_up_watch_active = False
+        self.furnace_up_watch_start = None
 
         self.tilt_count += 1
         self._log_event("tilt", watch_start, timestamp, tilt_number=self.tilt_count)
@@ -580,6 +685,35 @@ class HeatStateMachine:
             f"{self.heat_id}: furnace back to normal - tilt #{self.tilt_count} "
             "(no tapping detected)"
         )
+
+    def _resolve_furnace_up_watch(self, timestamp):
+        """furnace_position_normal seen while watching a furnace_position_up
+        sighting. Only counts as a tilt if furnace_position_up was held for
+        more than FURNACE_UP_TO_TILT_SECONDS - a quick pass through
+        furnace_position_up that snaps straight back to normal is treated
+        as a flicker, not a tilt."""
+        watch_start = self.furnace_up_watch_start
+        held = (timestamp - watch_start) if watch_start else datetime.timedelta(0)
+        self.furnace_up_watch_active = False
+        self.furnace_up_watch_start = None
+
+        if held >= FURNACE_UP_TO_TILT_THRESHOLD:
+            self.tilt_count += 1
+            self._log_event(
+                "tilt", watch_start, timestamp, tilt_number=self.tilt_count,
+                note=f"furnace_position_up held {round(held.total_seconds(), 1)}s",
+            )
+            self.last_event_desc = (
+                f"{self.heat_id}: furnace back to normal after "
+                f"{round(held.total_seconds(), 1)}s in furnace_position_up - "
+                f"tilt #{self.tilt_count} (no tapping detected)"
+            )
+        else:
+            self.last_event_desc = (
+                f"{self.heat_id}: furnace back to normal "
+                f"({round(held.total_seconds(), 1)}s in furnace_position_up, "
+                "below the 25s threshold - not counted as a tilt)"
+            )
 
     def _finalize_tapping(self, end_timestamp, reason=""):
         """Ends tapping and completes the heat. Triggered either by the

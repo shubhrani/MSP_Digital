@@ -26,10 +26,17 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import db  # noqa: E402
-from state_machine import HeatStateMachine  # noqa: E402
+from state_machine import ACTIVEFIRE_TIMEOUT_MINUTES, HeatStateMachine  # noqa: E402
 
 TMP_DIR = os.path.join(os.path.dirname(__file__), "_tmp_db")
 BASE = datetime.datetime(2026, 8, 11, 8, 0, 0)
+
+# Class names, matching state_machine.CLS_* (see the new model's class map
+# in config.py) - detections are fed in by name, not by numeric class ID.
+MAGNET_FEEDING_SCRAP = "magnet_feeding_scrap"
+SPONGE_FEEDER_ON_FURNACE = "spange_feeder_onfurnace"
+FURNACE_TILTING = "furnace_position_tilding"
+FURNACE_NORMAL = "furnace_position_normal"
 
 
 def t(minutes_offset):
@@ -153,16 +160,16 @@ def test_state_machine_feeds_the_recorder():
                           index_csv=os.path.join(TMP_DIR, "heats_index.csv"),
                           recorder=rec)
 
-    sm.process_detections({3}, t(0))            # heat starts
+    sm.process_detections({MAGNET_FEEDING_SCRAP}, t(0))            # heat starts
     keep_alive(sm, 8, 25)
-    sm.process_detections({8}, t(25))           # scrap -> sponge
+    sm.process_detections({SPONGE_FEEDER_ON_FURNACE}, t(25))       # scrap -> sponge
     keep_alive(sm, 33, 70)
-    sm.process_detections({12}, t(70))          # tilt begins (< 130 min sponge)
-    sm.process_detections({2}, t(71))           # tilt resolves, counted
+    sm.process_detections({FURNACE_TILTING}, t(70))                # tilt begins (< 130 min sponge)
+    sm.process_detections({FURNACE_NORMAL}, t(71))                 # tilt resolves, counted
     keep_alive(sm, 79, 160)
-    sm.process_detections({12}, t(160))         # >= 130 min sponge -> tapping starts
+    sm.process_detections({FURNACE_TILTING}, t(160))               # >= 130 min sponge -> tapping starts
     keep_alive(sm, 168, 175)
-    sm.process_detections({2}, t(175))          # furnace back to normal -> tapping ends
+    sm.process_detections({FURNACE_NORMAL}, t(175))                # furnace back to normal -> tapping ends
 
     starts = rec.of("heat_start")
     assert len(starts) == 1, starts
@@ -204,10 +211,10 @@ def test_no_recorder_is_csv_only():
     fresh_tmp()
     sm = HeatStateMachine(data_dir=os.path.join(TMP_DIR, "heats"),
                           index_csv=os.path.join(TMP_DIR, "heats_index.csv"))
-    sm.process_detections({3}, t(0))
+    sm.process_detections({MAGNET_FEEDING_SCRAP}, t(0))
     heat_id = sm.heat_id
     keep_alive(sm, 8, 25)
-    sm.process_detections({8}, t(25))
+    sm.process_detections({SPONGE_FEEDER_ON_FURNACE}, t(25))
     assert sm.recorder is None
     assert sm.heat_id == heat_id, "heat should still be the one started at t(0)"
     assert sm.state == sm.STATE_SPONGE_CHARGING
@@ -225,12 +232,12 @@ def test_activefire_watchdog_notifies_recorder():
                           index_csv=os.path.join(TMP_DIR, "heats_index.csv"),
                           recorder=rec, furnace_id="4/2")
 
-    sm.process_detections({3}, t(0))            # heat starts, no class 9 ever
+    sm.process_detections({MAGNET_FEEDING_SCRAP}, t(0))   # heat starts, no activefire ever
     heat_id = sm.heat_id
     csv_path = sm.get_heat_csv_path(heat_id)
     assert os.path.exists(csv_path)
 
-    sm.check_timeouts(t(10.5))                  # past the 10-minute timeout
+    sm.check_timeouts(t(ACTIVEFIRE_TIMEOUT_MINUTES + 0.5))  # past the timeout
 
     assert sm.state == sm.STATE_IDLE
     assert not os.path.exists(csv_path)

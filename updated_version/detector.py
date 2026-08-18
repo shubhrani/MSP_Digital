@@ -59,12 +59,13 @@ STATUS_FONT_SCALE = 0.85
 STATUS_THICKNESS = 2
 
 
-def draw_detections(frame, detections, highlight_class_ids):
+def draw_detections(frame, detections, highlight_names):
     """Draw bounding boxes for every detection, highlighting the classes the
-    state machine actually cares about."""
+    state machine actually cares about (matched by name - see
+    state_machine.RELEVANT_CLASS_NAMES)."""
     for det in detections:
         x1, y1, x2, y2 = [int(v) for v in det["box"]]
-        is_relevant = det["class_id"] in highlight_class_ids
+        is_relevant = det["name"] in highlight_names
         color = COLOR_OF_INTEREST if is_relevant else COLOR_OTHER
         box_thickness = 3 if is_relevant else 2
 
