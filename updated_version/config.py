@@ -21,7 +21,7 @@ RECONNECT_DELAY_SECONDS = 5
 # ---------------------------------------------------------------------------
 # Model
 # ---------------------------------------------------------------------------
-MODEL_PATH = "models/best_latest_model.pt"
+MODEL_PATH = "models/self_trained_200.pt"
 
 # Minimum confidence for a detection to be considered at all.
 CONFIDENCE_THRESHOLD = 0.5
@@ -253,15 +253,12 @@ PROCESS_CLASSES = {
     # tapping".
     "furnace_normal": "furnace_position_normal",
 
-    # Furnace visibly leaving the normal position - the tilt/tapping signal
-    # watched during sponge charging (see TILT_TO_TAPPING_MINUTES below for
-    # its own promote-to-tapping timer).
+    # Furnace visibly leaving the normal position - the only signal tapping
+    # reacts to. See TILT_TO_TAPPING_MINUTES / SPONGE_FAST_TRACK_MINUTES
+    # below and the module docstring in state_machine.py for the two ways
+    # it starts tapping.
     "furnace_tilting": "furnace_position_tilding",
-
-    # Furnace bottom fully visible -> tapping has definitely started,
-    # regardless of how long sponge charging has run or whether a tilt was
-    # ever watched for this movement.
-    "furnace_tapping_bottom_visible": "furnace_bottom_visiblecompletely",
+    "furnace_tilting_alt": "furnace_position_up",
 
     # Heartbeat only - every confirmed sighting resets the active-fire
     # watchdog clock for whatever heat is currently in progress. Doesn't
@@ -291,8 +288,16 @@ SPONGE_FAST_TRACK_MINUTES = 130
 
 # furnace_tilting held open this long without furnace_normal confirming it
 # was "just a tilt" -> promoted straight into tapping, backdated to when
-# the tilt itself began.
-TILT_TO_TAPPING_MINUTES = 2.5
+# the tilt itself began. This is one of only two ways tapping can start -
+# see TILT_TO_TAPPING_MINUTES / SPONGE_FAST_TRACK_MINUTES in
+# state_machine.py's module docstring.
+TILT_TO_TAPPING_MINUTES = 3.5
+
+# Tapping cannot run longer than this, full stop: if furnace_position_normal
+# hasn't been detected by the time this many minutes have elapsed, the
+# state machine forces tapping to end (and the heat to complete) anyway,
+# logged with a note.
+TAPPING_MAX_MINUTES = 7
 
 # If a heat is in progress and furnace_activefire hasn't been confirmed for
 # this many minutes, the heat is treated as invalid (camera lost the fire /

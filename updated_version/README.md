@@ -145,69 +145,96 @@ step - it's a one-line edit in `config.py`, nothing else needs to change:
 ```python
 # config.py
 PROCESS_CLASSES = {
-    "scrap_charging_start":  "magnet_feeding_scrap",
-    "sponge_charging_start": "spange_feeder_onfurnace",
-    "furnace_normal":        "furnace_position_normal",
-    "furnace_tilting":       "furnace_position_tilding",
-    "furnace_up":            "furnace_position_up",
-    "furnace_activefire":    "furnace_operation_activefire",
+    "scrap_charging_start":       "magnet_feeding_scrap",
+    "scrap_charging_magnet_alt":  "magnet_moving_withscrap_above_furnace_normal",
+    "sponge_charging_start":      "spange_feeder_onfurnace",
+    "sponge_charging_start_alt":  "spange_feeder_engaged",
+    "furnace_normal":             "furnace_position_normal",
+    "furnace_tilting":            "furnace_position_tilding",
+    "furnace_activefire":         "furnace_operation_activefire",
 }
 ```
 
 All the timing thresholds below are likewise plain numbers at the bottom
-of `config.py` (`SPONGE_FAST_TRACK_MINUTES`, `TILT_TO_TAPPING_MINUTES`,
-`FURNACE_UP_TO_TILT_SECONDS`, `FURNACE_UP_TO_TAPPING_MINUTES`,
-`ACTIVEFIRE_TIMEOUT_MINUTES`) - change the value there, restart the app,
-done.
+of `config.py` (`SCRAP_CHARGING_MAX_MINUTES`, `SPONGE_CHARGING_MAX_MINUTES`,
+`SPONGE_FAST_TRACK_MINUTES`, `TILT_TO_TAPPING_MINUTES`,
+`TAPPING_MAX_MINUTES`, `ACTIVEFIRE_TIMEOUT_MINUTES`) - change the value
+there, restart the app, done.
 
 | Role (`PROCESS_CLASSES` key) | Default class name | Effect |
 |---|---|---|
 | `scrap_charging_start` | `magnet_feeding_scrap` | Starts a **new heat**; starts the *scrap charging* clock. If this fires while the *previous* heat is still in `TAPPING`, that heat is closed out immediately and the new heat starts from this same moment. |
+| `scrap_charging_magnet_alt` | *(derived, not a model class)* | Same effect as `scrap_charging_start` above. Computed every frame from the raw `magnet_moving_withscrap` and `furnace_position_normal` boxes - true when the magnet box sits just above the furnace box (see "Scrap charging: the magnet-above-furnace signal" below). |
 | `sponge_charging_start` | `spange_feeder_onfurnace` | Ends *scrap charging*, starts the *sponge charging* clock. |
-| `furnace_tilting` | `furnace_position_tilding` | **Under `SPONGE_FAST_TRACK_MINUTES` (130 min) of sponge charging:** furnace leaves "normal" &mdash; the app starts *watching* to see whether this turns into tapping or is just a tilt. **At 130+ minutes:** immediately confirms tapping (fast track). |
-| `furnace_up` | `furnace_position_up` | An independent, second tilt/tapping signal watched the same way as `furnace_tilting` above, but on its own timers (`FURNACE_UP_TO_TILT_SECONDS` / `FURNACE_UP_TO_TAPPING_MINUTES`) - see below. |
-| `furnace_normal` | `furnace_position_normal` | While `TAPPING`: ends tapping, heat complete. While *watching* a tilt or up sighting: resolves it back to "just a tilt" (see below). |
+| `sponge_charging_start_alt` | `spange_feeder_engaged` | Same effect as `sponge_charging_start` above - either class ends scrap charging. |
+| `furnace_tilting` | `furnace_position_tilding` | The **only** signal tapping reacts to - see "Tapping: the only two ways in" below. |
+| `furnace_normal` | `furnace_position_normal` | While `TAPPING`: ends tapping, heat complete. While *watching* a tilt: resolves it back to "just a tilt" (see below). |
 | `furnace_activefire` | `furnace_operation_activefire` | Heartbeat only. Resets the active-fire watchdog clock; doesn't drive a transition on its own. |
 
-All other classes (magnet movement, ladle, negative samples, etc.) are
-detected and drawn on the video for your own reference, but don't drive
-any of the timers.
+All other classes (ladle, negative samples, etc.) are detected and drawn
+on the video for your own reference, but don't drive any of the timers.
 
-### The 130-minute fast track into tapping
+### Scrap charging: the magnet-above-furnace signal
 
-Once sponge charging has been running for `SPONGE_FAST_TRACK_MINUTES`
-(130 min by default) or more, the first `furnace_tilting` sighting is
-taken as tapping having started immediately &mdash; there's no need to
-also wait for the furnace to come back to "normal" first, the way the
-under-130-minute path does.
+`magnet_moving_withscrap` on its own doesn't mean anything to the state
+machine. Every processed frame, `camera_worker.py` checks whether a
+`magnet_moving_withscrap` box sits **just above** a `furnace_position_normal`
+box in that same frame (vertical gap under `MAGNET_ABOVE_FURNACE_MAX_GAP_PX`,
+80px by default, and horizontal overlap over `MAGNET_ABOVE_FURNACE_MIN_OVERLAP_RATIO`,
+15% by default) and, if so, feeds the derived class name into the state
+machine exactly like any other confirmed detection. Tune those two
+`config.py` values once you can see it against real footage.
 
-### Tilt vs. tapping: `furnace_tilting` and `furnace_up`
+### Tapping: the only two ways in
 
-Both classes are watched the same way, each on its own pair of timers:
+Tapping starts **only** when one of these two things happens - nothing
+else starts it:
 
-- **`furnace_tilting`** &mdash; if `furnace_normal` follows before
-  `TILT_TO_TAPPING_MINUTES` (1.9 min by default), it's just a tilt:
-  `tilt_count += 1`. If it's still open once that threshold passes with no
-  `furnace_normal` ever arriving, it's promoted straight into **tapping**
-  (backdated to when the tilt itself began) - a pure time check, so it
-  fires from `check_timeouts()` even with no further detection at all.
-- **`furnace_up`** &mdash; same idea, but held for at least
-  `FURNACE_UP_TO_TILT_SECONDS` (25 sec by default, to filter out brief
-  camera flicker) before counting as a tilt, and promoted to tapping if
-  it's still open past `FURNACE_UP_TO_TAPPING_MINUTES` (2 min by default).
+1. `furnace_tilting` is held open for more than `TILT_TO_TAPPING_MINUTES`
+   (**3.5 min** by default) without `furnace_normal` ever arriving to
+   resolve it &mdash; promoted straight into tapping, backdated to when
+   the tilt itself began. A pure time check, so it fires from
+   `check_timeouts()` even with no further detection at all.
+2. `furnace_tilting` is detected once sponge charging has already run for
+   `SPONGE_FAST_TRACK_MINUTES` (**130 min** by default) or more &mdash;
+   taken as tapping starting immediately, no need to also wait out
+   `TILT_TO_TAPPING_MINUTES` first (the "fast track").
 
-If both fire for the same physical movement, `furnace_tilting` takes
-priority and only one tilt (or one tapping-promotion) is counted for it -
-whichever resolves or times out first clears the watch for both.
+Anywhere under the 130-minute mark, a `furnace_tilting` sighting followed
+by `furnace_normal` inside `TILT_TO_TAPPING_MINUTES` is just a tilt:
+`tilt_count += 1`, and the app keeps waiting inside sponge charging.
 
 ### Ending a heat
 
-Tapping (and the heat) ends when **either** of these happens:
+Tapping (and the heat) ends whichever of these happens first:
 
 - `furnace_normal` is detected while `TAPPING`, or
-- `scrap_charging_start` (`magnet_feeding_scrap`) is detected &mdash; which
-  also means the *next* heat's scrap charging has begun, so a new heat
-  starts immediately from that same moment.
+- `TAPPING_MAX_MINUTES` (**7 min** by default) have passed since tapping
+  started with no `furnace_normal` detected &mdash; a hard cap, logged
+  with a note, purely time-based so it fires even with no detections at
+  all during that stretch, or
+- `scrap_charging_start` (`magnet_feeding_scrap`, or the magnet-above-
+  furnace signal) is detected &mdash; which also means the *next* heat's
+  scrap charging has begun, so a new heat starts immediately from that
+  same moment.
+
+### Scrap/sponge charging hard caps
+
+Independent of everything above:
+
+- Scrap charging cannot run longer than `SCRAP_CHARGING_MAX_MINUTES`
+  (**40 min** by default). If no `sponge_charging_start` signal has
+  arrived by then, the state machine forces the transition into sponge
+  charging anyway.
+- Sponge charging cannot run longer than `SPONGE_CHARGING_MAX_MINUTES`
+  (**140 min** by default). If tapping hasn't started by then, the state
+  machine forces the transition into tapping anyway. In practice this is
+  just a backstop behind the 130-minute fast track above - it only fires
+  if no `furnace_tilting` sighting ever arrived to trigger the fast track
+  itself.
+
+Both are pure time-based checks (`check_timeouts()`), so they fire even
+with no detections at all during that stretch.
 
 ### Active-fire watchdog (`furnace_activefire`)
 
@@ -229,23 +256,22 @@ scoped to only start once sponge charging begins.
 
 ### Assumptions I made where the spec was open-ended
 
-- **Tilt/tapping watching (both `furnace_tilting` and `furnace_up`) only
-  starts during sponge charging**, and the 130-minute fast track is
-  likewise only evaluated while the state is `SPONGE_CHARGING`. If your
-  furnace can also swing through these classes meaningfully during scrap
-  charging, tell me and I'll widen this.
+- **Tilt/tapping watching only starts during sponge charging**, and the
+  130-minute fast track is likewise only evaluated while the state is
+  `SPONGE_CHARGING`. If your furnace can also swing through
+  `furnace_tilting` meaningfully during scrap charging, tell me and I'll
+  widen this.
 - **All the time-based transitions are checked continuously**, not just
   when a new class is detected: the camera worker checks them on every
   frame, and the status API checks them on every request, so a tilt gets
-  promoted to tapping (or a heat gets deleted by the active-fire watchdog)
-  on time even during a stretch with no relevant detections at all.
+  promoted to tapping (or a hard cap fires, or a heat gets deleted by the
+  active-fire watchdog) on time even during a stretch with no relevant
+  detections at all.
 - **Debouncing:** a class has to be seen on `DEBOUNCE_FRAMES` (default 5)
   consecutive *processed* frames before it's treated as "confirmed" and
   handed to the logic above. This is there to stop a single flickery frame
   from starting/ending a stage. Tune it in `config.py` if it feels too
-  slow or too twitchy for your camera/model. `FURNACE_UP_TO_TILT_SECONDS`
-  is a second, independent filter specifically for `furnace_up`, aimed at
-  longer camera/model blips than single-frame flicker.
+  slow or too twitchy for your camera/model.
 
 If any of these read differently from what you had in mind, the state
 machine is isolated in `state_machine.py` and covered by
@@ -260,7 +286,7 @@ event,start_time,end_time,duration_minutes,tilt_number,note
 scrap_charging,2026-08-11T14:30:00,2026-08-11T14:52:00,22.0,,
 tilt,2026-08-11T15:10:00,2026-08-11T15:11:30,1.5,1,
 sponge_charging,2026-08-11T14:52:00,2026-08-11T16:10:00,78.0,,
-tapping,2026-08-11T16:10:00,2026-08-11T16:25:00,15.0,,
+tapping,2026-08-11T16:10:00,2026-08-11T16:15:30,5.5,,
 ```
 
 `data/heats_index.csv` keeps one summary row per heat (id, start, end,
@@ -290,13 +316,16 @@ any code:
   prefers the names baked into the `.pt` weights when present). Update this
   whenever you swap in a retrained model with a different class list/order.
 - **`PROCESS_CLASSES`** &mdash; which class NAME drives each step (scrap
-  charging start, sponge charging start, furnace normal/tilting/up, active
-  fire). This is the dict to edit if a retrain renames a class, or you
-  simply want a different signal to drive a step - see section 3 above.
-- **Timings** &mdash; `SPONGE_FAST_TRACK_MINUTES`, `TILT_TO_TAPPING_MINUTES`,
-  `FURNACE_UP_TO_TILT_SECONDS`, `FURNACE_UP_TO_TAPPING_MINUTES`,
-  `ACTIVEFIRE_TIMEOUT_MINUTES` &mdash; also plain numbers in `config.py`,
-  right below `PROCESS_CLASSES`.
+  charging start + its magnet-above-furnace alt, sponge charging start +
+  its alt, furnace normal/tilting, active fire). This is the dict to edit
+  if a retrain renames a class, or you simply want a different signal to
+  drive a step - see section 3 above.
+- **Timings** &mdash; `SCRAP_CHARGING_MAX_MINUTES`, `SPONGE_CHARGING_MAX_MINUTES`,
+  `SPONGE_FAST_TRACK_MINUTES`, `TILT_TO_TAPPING_MINUTES`,
+  `TAPPING_MAX_MINUTES`, `ACTIVEFIRE_TIMEOUT_MINUTES` &mdash; also plain
+  numbers in `config.py`, right below `PROCESS_CLASSES`.
+- **Magnet-above-furnace spatial thresholds** &mdash;
+  `MAGNET_ABOVE_FURNACE_MAX_GAP_PX`, `MAGNET_ABOVE_FURNACE_MIN_OVERLAP_RATIO`.
 
 Restart the app after editing any of these for the change to take effect.
 

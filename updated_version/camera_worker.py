@@ -123,8 +123,8 @@ class CameraWorker(threading.Thread):
                 except Exception:
                     logger.exception("Detection failed on this frame, showing raw video for it")
 
-            # Purely time-based transitions (the 15-minute tapping timer,
-            # the 1.9-minute tilt -> tapping promotion, the active-fire
+            # Purely time-based transitions (the scrap/sponge/tapping hard
+            # caps, the tilt -> tapping promotion, the active-fire
             # watchdog) don't depend on any detection, so give them a
             # chance to fire on every frame - this way a heat still closes
             # out (or gets cleaned up) on time even during a stretch with

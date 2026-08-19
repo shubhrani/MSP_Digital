@@ -29,17 +29,16 @@ and its classes get renumbered, as long as the class *names* stay the same):
   SPONGE_CHARGING_MAX_MINUTES (140 min by default) - see "Hard time caps"
   below.
 
-  Tapping can start three ways:
-    - furnace_bottom_visiblecompletely is detected at any point during
-      sponge charging -> tapping starts immediately, or
+  Tapping starts EITHER of two ways (no other signal starts tapping):
     - furnace_position_tilding is held open for more than
-      TILT_TO_TAPPING_MINUTES (2.5 min) without furnace_position_normal
-      confirming it was just a tilt -> promoted straight into tapping (see
-      "Tilt duration -> tapping promotion" below), or
+      TILT_TO_TAPPING_MINUTES (3.5 min) without furnace_position_normal
+      confirming it was just a tilt -> promoted straight into tapping,
+      backdated to when the tilt itself began (see "Tilt duration ->
+      tapping promotion" below), or
     - furnace_position_tilding is detected once sponge charging has
       already run for SPONGE_FAST_TRACK_MINUTES (130 min) or more -> taken
-      as tapping starting immediately, no need to also see the furnace
-      return to normal first (the "fast track").
+      as tapping starting immediately, no need to also wait out
+      TILT_TO_TAPPING_MINUTES first (the "fast track").
 
   Watching for tapping while sponge charging is in progress (under the
   130-minute fast-track threshold):
@@ -61,13 +60,17 @@ and its classes get renumbered, as long as the class *names* stay the same):
   heat is assumed to already be in progress and is picked up immediately
   from whichever stage that implies, rather than sitting in IDLE waiting
   indefinitely for the next scrap charging. See
-  MID_PROCESS_SPONGE_CLASS_NAMES / MID_PROCESS_TAPPING_CLASS_NAMES below.
+  MID_PROCESS_SPONGE_CLASS_NAMES below - there's no class that on its own
+  definitively means "tapping already in progress", so a mid-process
+  pickup always starts from SPONGE_CHARGING and lets the normal tilting
+  rules above sort out whether tapping has actually started.
   The skipped earlier stage(s) are logged with an unknown start/duration
   instead of a guessed one.
 
   Ending a heat (tapping -> IDLE), whichever happens first:
     - furnace_position_normal is detected while TAPPING, or
-    - 15 minutes have passed since tapping started, or
+    - TAPPING_MAX_MINUTES (7 min) have passed since tapping started with
+      no furnace_position_normal detected - see "Hard time caps" below, or
     - magnet_feeding_scrap (or the magnet-above-furnace signal) is
       detected (this also means the *next* heat's scrap charging has
       begun, so a new heat starts immediately from this same moment).
@@ -75,7 +78,7 @@ and its classes get renumbered, as long as the class *names* stay the same):
   Tilt duration -> tapping promotion (on top of the rules above):
   While the app is "watching" a tilt (see furnace_position_tilding above,
   under-130-minute case), if the furnace stays out of the normal position
-  for more than TILT_TO_TAPPING_MINUTES (2.5 min) *without*
+  for more than TILT_TO_TAPPING_MINUTES (3.5 min) *without*
   furnace_position_normal ever confirming it was just a tilt, the watch is
   promoted straight into tapping - same as the 130-minute fast track, just
   triggered by how long this one tilt has run instead of by total
@@ -94,8 +97,12 @@ and its classes get renumbered, as long as the class *names* stay the same):
       this is a backstop behind the 130-minute fast track above - it only
       fires if no furnace_position_tilding sighting arrived between minute
       130 and minute 140 to trigger the fast track itself.
-  Both are pure time-based checks (see check_timeouts / _check_timeouts_locked
-  below), so they fire even with no detections at all during that stretch.
+    - If tapping has been running for TAPPING_MAX_MINUTES (7 min) with no
+      furnace_position_normal detected yet, the state machine forces
+      tapping to end (and the heat to complete) anyway, logged with a note.
+  All three are pure time-based checks (see check_timeouts /
+  _check_timeouts_locked below), so they fire even with no detections at
+  all during that stretch.
 
   Active-fire watchdog (independent of the above):
   furnace_operation_activefire  -> heartbeat only; doesn't drive any stage
@@ -156,9 +163,9 @@ CLS_FURNACE_ACTIVEFIRE = config.PROCESS_CLASSES["furnace_activefire"]
 CLS_FURNACE_NORMAL = config.PROCESS_CLASSES["furnace_normal"]
 CLS_MAGNET_FEEDING_SCRAP = config.PROCESS_CLASSES["scrap_charging_start"]
 CLS_FURNACE_TILTING = config.PROCESS_CLASSES["furnace_tilting"]
+CLS_FURNACE_TILTING_ALT = config.PROCESS_CLASSES.get("furnace_tilting_alt")
 CLS_SPONGE_FEEDER_ON_FURNACE = config.PROCESS_CLASSES["sponge_charging_start"]
 CLS_SPONGE_FEEDER_ENGAGED = config.PROCESS_CLASSES["sponge_charging_start_alt"]
-CLS_FURNACE_BOTTOM_VISIBLE = config.PROCESS_CLASSES["furnace_tapping_bottom_visible"]
 
 # Derived signal (not a raw model class - see camera_worker.py /
 # detector.magnet_above_furnace_normal()) and the raw class name it's
@@ -176,8 +183,9 @@ RELEVANT_CLASS_NAMES = {
     CLS_SPONGE_FEEDER_ENGAGED,
     CLS_FURNACE_ACTIVEFIRE,
     CLS_FURNACE_TILTING,
-    CLS_FURNACE_BOTTOM_VISIBLE,
 }
+if CLS_FURNACE_TILTING_ALT:
+    RELEVANT_CLASS_NAMES.add(CLS_FURNACE_TILTING_ALT)
 
 # ---------------------------------------------------------------------------
 # Mid-process start-up
@@ -191,15 +199,20 @@ RELEVANT_CLASS_NAMES = {
 # that case.
 #
 # spange_feeder_onfurnace / spange_feeder_engaged, or the furnace visibly
-# moving -> already in sponge charging (or a tilt inside it); jump straight
-# there.
+# moving -> already in sponge charging (or a tilt/tapping inside it); jump
+# straight there and let the normal SPONGE_CHARGING logic below sort out
+# whether this particular tilting sighting is just a tilt or is tapping.
 MID_PROCESS_SPONGE_CLASS_NAMES = {
     CLS_SPONGE_FEEDER_ON_FURNACE,
     CLS_SPONGE_FEEDER_ENGAGED,
     CLS_FURNACE_TILTING,
 }
-# furnace_bottom_visiblecompletely definitively indicates tapping on its own.
-MID_PROCESS_TAPPING_CLASS_NAMES = {CLS_FURNACE_BOTTOM_VISIBLE}
+if CLS_FURNACE_TILTING_ALT:
+    MID_PROCESS_SPONGE_CLASS_NAMES.add(CLS_FURNACE_TILTING_ALT)
+# No class definitively indicates tapping has already started on its own -
+# tapping is only ever entered via the two rules in the module docstring
+# above, both of which start from SPONGE_CHARGING.
+MID_PROCESS_TAPPING_CLASS_NAMES = set()
 
 CSV_HEADERS = ["event", "start_time", "end_time", "duration_minutes", "tilt_number", "note"]
 INDEX_HEADERS = ["heat_id", "start_time", "end_time", "duration_minutes",
@@ -210,7 +223,7 @@ INDEX_HEADERS = ["heat_id", "start_time", "end_time", "duration_minutes",
 EXPECTED_DURATION_MIN = {
     "scrap_charging": (20, 30),
     "sponge_charging": (60, 150),
-    "tapping": (10, 20),
+    "tapping": (2, 7),
 }
 
 # ---------------------------------------------------------------------------
@@ -232,6 +245,13 @@ SPONGE_FAST_TRACK_THRESHOLD = datetime.timedelta(minutes=SPONGE_FAST_TRACK_MINUT
 # straight into tapping, whether or not furnace_position_normal ever confirms it.
 TILT_TO_TAPPING_MINUTES = config.TILT_TO_TAPPING_MINUTES
 TILT_TO_TAPPING_THRESHOLD = datetime.timedelta(minutes=TILT_TO_TAPPING_MINUTES)
+
+# Tapping cannot run longer than this, full stop: if furnace_position_normal
+# hasn't been detected by the time this many minutes have elapsed since
+# tapping started, the state machine forces tapping to end (and the heat to
+# complete) anyway.
+TAPPING_MAX_MINUTES = config.TAPPING_MAX_MINUTES
+TAPPING_MAX_THRESHOLD = datetime.timedelta(minutes=TAPPING_MAX_MINUTES)
 
 # If a heat is in progress and furnace_operation_activefire hasn't
 # been confirmed for this long, the heat is deleted (SQL + CSV) and the app
@@ -381,10 +401,9 @@ class HeatStateMachine:
             if self.state == self.STATE_SPONGE_CHARGING:
                 sponge_elapsed = timestamp - self.sponge_start if self.sponge_start else datetime.timedelta(0)
 
-                if CLS_FURNACE_BOTTOM_VISIBLE in newly_confirmed_ids:
-                    self._enter_tapping(timestamp, timestamp, note="furnace_bottom_visiblecompletely detected")
+                is_tilting = CLS_FURNACE_TILTING in newly_confirmed_ids or (CLS_FURNACE_TILTING_ALT and CLS_FURNACE_TILTING_ALT in newly_confirmed_ids)
 
-                elif CLS_FURNACE_TILTING in newly_confirmed_ids:
+                if is_tilting:
                     if sponge_elapsed >= SPONGE_FAST_TRACK_THRESHOLD:
                         self._enter_tapping(timestamp, timestamp, note=f">{SPONGE_FAST_TRACK_MINUTES} min sponge charging")
                     elif not self.furnace_watch_active:
@@ -511,6 +530,17 @@ class HeatStateMachine:
             self._enter_tapping(
                 timestamp, timestamp,
                 note=f"sponge charging hit {SPONGE_CHARGING_MAX_MINUTES} min cap",
+            )
+
+        # Hard cap: tapping cannot run longer than TAPPING_MAX_MINUTES. If
+        # furnace_position_normal hasn't been detected by then, force
+        # tapping to end (and the heat to complete) anyway.
+        if (self.state == self.STATE_TAPPING
+                and self.tapping_start is not None
+                and (timestamp - self.tapping_start) >= TAPPING_MAX_THRESHOLD):
+            self._finalize_tapping(
+                timestamp,
+                reason=f"tapping hit {TAPPING_MAX_MINUTES} min cap without furnace_position_normal",
             )
 
         # Active-fire watchdog: a heat is running but furnace_operation_activefire hasn't been
@@ -678,8 +708,10 @@ class HeatStateMachine:
         )
 
     def _finalize_tapping(self, end_timestamp, reason=""):
-        """Ends tapping and completes the heat. Triggered either by the
-        15-minute timer or by a magnet_feeding_scrap detection."""
+        """Ends tapping and completes the heat. Triggered either by a
+        furnace_position_normal detection, the TAPPING_MAX_MINUTES (7 min)
+        cap, or a magnet_feeding_scrap / magnet-above-furnace detection
+        (the next heat's scrap charging beginning)."""
         self._log_event("tapping", self.tapping_start, end_timestamp, note=reason)
         self._update_index_row(self.heat_id, status="COMPLETE", end=end_timestamp,
                                 tilt_count=self.tilt_count)

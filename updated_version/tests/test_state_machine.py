@@ -11,15 +11,16 @@ Exercises the full heat cycle logic:
      (the derived CLS_MAGNET_ABOVE_FURNACE signal) also starting a new heat.
   5. spange_feeder_onfurnace OR spange_feeder_engaged ending scrap charging
      and starting sponge charging.
-  6. furnace_bottom_visiblecompletely starting tapping immediately, at any
-     point during sponge charging.
-  7. A tilt held open past TILT_TO_TAPPING_MINUTES (2.5 min) gets promoted
-     to tapping even with no furnace_position_normal ever arriving.
-  8. Hard time caps: scrap charging forced into sponge charging at
+  6. Tapping starts ONLY two ways: furnace_position_tilding held open past
+     TILT_TO_TAPPING_MINUTES (3.5 min) with no furnace_position_normal
+     ever arriving, or furnace_position_tilding detected once sponge
+     charging has run for SPONGE_FAST_TRACK_MINUTES (130 min) or more.
+  7. Hard time caps: scrap charging forced into sponge charging at
      SCRAP_CHARGING_MAX_MINUTES (40 min); sponge charging forced into
-     tapping at SPONGE_CHARGING_MAX_MINUTES (140 min) - both even with no
-     qualifying detection at all.
-  9. A heat with no confirmed furnace_operation_activefire for
+     tapping at SPONGE_CHARGING_MAX_MINUTES (140 min); tapping forced to
+     end at TAPPING_MAX_MINUTES (7 min) with no furnace_position_normal -
+     all three even with no qualifying detection at all.
+  8. A heat with no confirmed furnace_operation_activefire for
      ACTIVEFIRE_TIMEOUT_MINUTES gets its data deleted (CSV + index row) and
      the state machine drops back to IDLE.
 
@@ -58,7 +59,6 @@ SPONGE_FEEDER_ON_FURNACE = "spange_feeder_onfurnace"
 SPONGE_FEEDER_ENGAGED = "spange_feeder_engaged"
 FURNACE_TILTING = "furnace_position_tilding"
 FURNACE_NORMAL = "furnace_position_normal"
-FURNACE_BOTTOM_VISIBLE = "furnace_bottom_visiblecompletely"
 FURNACE_ACTIVEFIRE = "furnace_operation_activefire"
 
 
@@ -177,27 +177,41 @@ def test_sponge_charging_alt_trigger():
 
 
 # ---------------------------------------------------------------------------
-def test_furnace_bottom_visible_starts_tapping_immediately():
-    """furnace_bottom_visiblecompletely detected at any point during sponge
-    charging starts tapping immediately, with no tilt watch needed first."""
+def test_tilting_starts_tapping_after_3_5_minutes():
+    """furnace_position_tilding held open for more than
+    TILT_TO_TAPPING_MINUTES (3.5 min), under the 130-min fast track,
+    without furnace_position_normal resolving it, is promoted straight into
+    tapping - this and the 130-min fast track below are the ONLY two ways
+    tapping starts."""
     sm = fresh_machine()
 
     sm.process_detections({MAGNET_FEEDING_SCRAP}, t(0))
     keep_alive(sm, 5, 20)
-    sm.process_detections({SPONGE_FEEDER_ON_FURNACE}, t(20))
-    keep_alive(sm, 25, 40)
+    sm.process_detections({SPONGE_FEEDER_ON_FURNACE}, t(20))     # sponge starts, well under 130 min
+    keep_alive(sm, 25, 30)
 
-    detect_time = t(40)
-    sm.process_detections({FURNACE_BOTTOM_VISIBLE}, detect_time)
+    sm.process_detections({FURNACE_TILTING}, t(30))              # tilt begins
+    assert sm.state == sm.STATE_SPONGE_CHARGING
+    assert sm.furnace_watch_active is True
+
+    # Under the threshold: still just a watched tilt.
+    sm.check_timeouts(t(30) + datetime.timedelta(minutes=2.5))
+    assert sm.state == sm.STATE_SPONGE_CHARGING
+    assert sm.furnace_watch_active is True
+
+    # Past the threshold: promoted to tapping, backdated to when the tilt
+    # itself began (not to the moment the threshold was crossed).
+    sm.check_timeouts(t(30) + datetime.timedelta(minutes=4.0))
     assert sm.state == sm.STATE_TAPPING
-    assert sm.tapping_start == detect_time
+    assert sm.furnace_watch_active is False
+    assert sm.tapping_start == t(30)
 
     sponge_row = next(r for r in read_csv(sm.get_heat_csv_path(sm.heat_id))
                       if r["event"] == "sponge_charging")
-    assert sponge_row["end_time"] == detect_time.isoformat()
-    assert "furnace_bottom_visiblecompletely" in sponge_row["note"]
+    assert sponge_row["end_time"] == t(30).isoformat()
+    assert "3.5" in sponge_row["note"]
 
-    print("test_furnace_bottom_visible_starts_tapping_immediately passed.")
+    print("test_tilting_starts_tapping_after_3_5_minutes passed.")
 
 
 # ---------------------------------------------------------------------------
@@ -287,21 +301,26 @@ def test_mid_process_start_into_sponge_charging():
 
 # ---------------------------------------------------------------------------
 def test_mid_process_start_into_tapping():
-    """App is (re)started while the furnace is already tapping: the very
-    first detection ever seen is furnace_bottom_visiblecompletely. The heat
-    should be picked up immediately in TAPPING, with scrap/sponge charging
-    both logged as unknown-duration."""
+    """App is (re)started while the furnace is already mid-tapping: the
+    very first detection ever seen is furnace_position_tilding, held past
+    TILT_TO_TAPPING_MINUTES. Since no class definitively means "already
+    tapping" on its own anymore, the pickup starts in SPONGE_CHARGING and
+    the normal tilt-promotion rule takes it into TAPPING from there, with
+    scrap/sponge both logged as unknown-duration."""
     sm = fresh_machine()
 
-    sm.process_detections({FURNACE_BOTTOM_VISIBLE}, t(0))
-    assert sm.state == sm.STATE_TAPPING
-    assert sm.tapping_start == t(0)
+    sm.process_detections({FURNACE_TILTING}, t(0))
+    assert sm.state == sm.STATE_SPONGE_CHARGING
     assert sm.scrap_start is None
-    assert sm.sponge_start is None
+    assert sm.sponge_start == t(0)
+    assert sm.furnace_watch_active is True
 
     rows = read_csv(sm.get_heat_csv_path(sm.heat_id))
     assert rows[0]["event"] == "scrap_charging_unknown"
-    assert rows[1]["event"] == "sponge_charging_unknown"
+
+    sm.check_timeouts(t(0) + datetime.timedelta(minutes=4.0))
+    assert sm.state == sm.STATE_TAPPING
+    assert sm.tapping_start == t(0)
 
     sm.process_detections({FURNACE_NORMAL}, t(10))
     assert sm.state == sm.STATE_IDLE
@@ -310,41 +329,43 @@ def test_mid_process_start_into_tapping():
 
 
 # ---------------------------------------------------------------------------
-def test_tilt_over_threshold_promoted_to_tapping():
-    """A tilt that never resolves via furnace_position_normal (and hasn't
-    reached the 130-minute fast track) is promoted straight into tapping
-    once it has been open for more than TILT_TO_TAPPING_MINUTES (2.5 min) -
-    a pure time-based check, so it fires purely from check_timeouts()
-    without any further detection ever arriving for that movement."""
+def test_tapping_hard_cap():
+    """Tapping cannot run longer than TAPPING_MAX_MINUTES (7 min) - if
+    furnace_position_normal hasn't been detected by then, the state machine
+    forces tapping to end (and the heat to complete) anyway, purely from
+    check_timeouts()."""
     sm = fresh_machine()
 
     sm.process_detections({MAGNET_FEEDING_SCRAP}, t(0))
     keep_alive(sm, 5, 20)
-    sm.process_detections({SPONGE_FEEDER_ON_FURNACE}, t(20))     # sponge starts, well under 130 min
-    keep_alive(sm, 25, 30)
+    sm.process_detections({SPONGE_FEEDER_ON_FURNACE}, t(20))
+    keep_alive(sm, 25, 155)
 
-    sm.process_detections({FURNACE_TILTING}, t(30))              # tilt begins
-    assert sm.state == sm.STATE_SPONGE_CHARGING
-    assert sm.furnace_watch_active is True
-
-    # Under the threshold: still just a watched tilt.
-    sm.check_timeouts(t(30) + datetime.timedelta(minutes=1.5))
-    assert sm.state == sm.STATE_SPONGE_CHARGING
-    assert sm.furnace_watch_active is True
-
-    # Past the threshold: promoted to tapping, backdated to when the tilt
-    # itself began (not to the moment the threshold was crossed).
-    sm.check_timeouts(t(30) + datetime.timedelta(minutes=3.0))
+    # Fast-track into tapping (well past 130 min of sponge charging)
+    tap_start = t(20 + 135)
+    sm.process_detections({FURNACE_TILTING}, tap_start)
     assert sm.state == sm.STATE_TAPPING
-    assert sm.furnace_watch_active is False
-    assert sm.tapping_start == t(30)
+    heat_id = sm.heat_id
 
-    sponge_row = next(r for r in read_csv(sm.get_heat_csv_path(sm.heat_id))
-                      if r["event"] == "sponge_charging")
-    assert sponge_row["end_time"] == t(30).isoformat()
-    assert "2.5" in sponge_row["note"]
+    # Just under the cap: still tapping.
+    sm.check_timeouts(tap_start + datetime.timedelta(minutes=6.5))
+    assert sm.state == sm.STATE_TAPPING
+    assert sm.heat_id == heat_id
 
-    print("test_tilt_over_threshold_promoted_to_tapping passed.")
+    # Past the cap: forced to end, heat completes, back to IDLE.
+    cap_time = tap_start + datetime.timedelta(minutes=7.5)
+    sm.check_timeouts(cap_time)
+    assert sm.state == sm.STATE_IDLE
+
+    old_rows = read_csv(sm.get_heat_csv_path(heat_id))
+    tapping_row = next(r for r in old_rows if r["event"] == "tapping")
+    assert tapping_row["end_time"] == cap_time.isoformat()
+    assert "7" in tapping_row["note"]
+
+    index_rows = {r["heat_id"]: r for r in sm.get_heats_history()}
+    assert index_rows[heat_id]["status"] == "COMPLETE"
+
+    print("test_tapping_hard_cap passed.")
 
 
 # ---------------------------------------------------------------------------
@@ -476,11 +497,11 @@ if __name__ == "__main__":
     test_tilts_and_normal_tapping()
     test_magnet_above_furnace_starts_scrap_charging()
     test_sponge_charging_alt_trigger()
-    test_furnace_bottom_visible_starts_tapping_immediately()
+    test_tilting_starts_tapping_after_3_5_minutes()
     test_fast_track_after_130_min_and_tapping_end()
     test_mid_process_start_into_sponge_charging()
     test_mid_process_start_into_tapping()
-    test_tilt_over_threshold_promoted_to_tapping()
+    test_tapping_hard_cap()
     test_scrap_charging_hard_cap()
     test_sponge_charging_hard_cap()
     test_heat_deleted_after_activefire_timeout()
