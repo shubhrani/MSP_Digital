@@ -1,0 +1,4 @@
+event,start_time,end_time,duration_minutes,tilt_number,note
+scrap_charging,2026-09-19T01:13:39.507265,2026-09-19T01:23:02.627410,9.39,,
+sponge_charging,2026-09-19T01:23:02.627410,2026-09-19T01:25:43.621093,2.68,,furnace position up
+tapping,2026-09-19T01:25:43.621093,2026-09-19T01:25:44.247721,0.01,,furnace returned to normal

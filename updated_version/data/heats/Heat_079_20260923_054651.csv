@@ -1,0 +1,14 @@
+event,start_time,end_time,duration_minutes,tilt_number,note
+scrap_charging,2026-09-23T05:46:51.658818,2026-09-23T06:17:36.612985,30.75,,
+slag_removal,2026-09-23T06:58:32.827929,2026-09-23T06:58:32.827929,0.0,,magnet moving slag
+slag_removal,2026-09-23T07:12:57.051178,2026-09-23T07:12:57.051178,0.0,,magnet moving slag
+slag_removal,2026-09-23T07:14:33.237439,2026-09-23T07:14:33.237439,0.0,,magnet moving slag
+slag_removal,2026-09-23T07:14:38.963671,2026-09-23T07:14:38.963671,0.0,,magnet moving slag
+slag_removal,2026-09-23T07:14:40.568960,2026-09-23T07:14:40.568960,0.0,,magnet moving slag
+slag_removal,2026-09-23T07:39:22.597761,2026-09-23T07:39:22.597761,0.0,,magnet moving slag
+slag_removal,2026-09-23T07:39:30.246435,2026-09-23T07:39:30.246435,0.0,,magnet moving slag
+slag_removal,2026-09-23T07:39:39.272027,2026-09-23T07:39:39.272027,0.0,,magnet moving slag
+slag_removal,2026-09-23T07:39:45.647023,2026-09-23T07:39:45.647023,0.0,,magnet moving slag
+slag_removal,2026-09-23T07:39:59.316184,2026-09-23T07:39:59.316184,0.0,,magnet moving slag
+sponge_charging,2026-09-23T06:17:36.612985,2026-09-23T06:23:11.641929,5.58,,furnace_bottom_visiblecompletely (24) followed by laddle_moving_withmeltiron (25)
+tapping,2026-09-23T06:23:11.641929,2026-09-23T07:27:39.272282,64.46,,furnace had already returned to normal; tapping confirmed by visual evidence (24 then 25)

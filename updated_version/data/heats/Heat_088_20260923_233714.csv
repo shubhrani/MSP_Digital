@@ -1,0 +1,4 @@
+event,start_time,end_time,duration_minutes,tilt_number,note
+scrap_charging_unknown,,,,,app started during sponge charging
+tilt,2026-09-23T23:37:14.762305,2026-09-23T23:38:08.483851,0.9,1,
+tilt,2026-09-23T23:41:08.976997,2026-09-23T23:43:20.712075,2.2,2,

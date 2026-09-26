@@ -82,14 +82,60 @@
     </div>
 
     <div class="event-log" id="event-log">Waiting for scrap charging to begin&hellip;</div>
+
+    <div class="frame-strip-wrap" id="frames-section">
+      <div class="frame-strip-header">
+        <div class="frame-strip-header__left">
+          <div class="card__eyebrow" style="margin-bottom:0;">Process Detection &amp; Transition Frames</div>
+          <span class="frames-count-badge" id="frames-count-badge">0 frames</span>
+        </div>
+        <div class="frame-strip-header__controls">
+          <div class="frame-control-item">
+            <label for="frame-heat-select" class="frame-control-label">Heat:</label>
+            <select id="frame-heat-select" class="frame-select" onchange="onHeatSelectChanged()">
+              <option value="">Current Heat</option>
+            </select>
+          </div>
+          <div class="frame-view-toggle">
+            <button type="button" class="btn-view-toggle is-active" id="btn-view-annotated" onclick="setFrameViewMode('annotated')" title="Show frames with bounding boxes">
+              🎯 Bounding Box
+            </button>
+            <button type="button" class="btn-view-toggle" id="btn-view-raw" onclick="setFrameViewMode('raw')" title="Show frames without bounding boxes">
+              📷 Raw Frame
+            </button>
+          </div>
+          <button type="button" class="btn-refresh-frames" onclick="pollFrames()" title="Refresh frames">
+            🔄
+          </button>
+        </div>
+      </div>
+      <div class="frame-strip" id="frame-strip">
+        <div class="frame-empty">No frames captured yet</div>
+      </div>
+    </div>
   </section>
 
   <aside class="side-column">
+
+    <div class="card pyro-card">
+      <div class="card__eyebrow">PYRO temperatures &middot; InfluxDB</div>
+      <div class="pyro-grid" id="pyro-grid">
+        <div class="pyro-empty">Waiting for data&hellip;</div>
+      </div>
+    </div>
+
+    <div class="card streams-card">
+      <div class="card__eyebrow">Camera streams</div>
+      <div class="streams-grid" id="streams-grid">
+        <div class="streams-empty">Loading&hellip;</div>
+      </div>
+    </div>
 
     <div class="card heat-card">
       <div class="card__eyebrow">Current heat &middot; {{ furnace_name }}</div>
       <div class="heat-card__id" id="heat-id">&mdash;</div>
       <div class="heat-card__stage" id="heat-stage">IDLE</div>
+      <div class="heat-card__binding" id="heat-binding">&mdash;</div>
     </div>
 
     <div class="card history-card">
@@ -103,19 +149,150 @@
               <th>Dur.</th>
               <th>Tilts</th>
               <th>Status</th>
-              <th></th>
+              <th>Frames</th>
+              <th>CSV</th>
             </tr>
           </thead>
           <tbody id="history-body">
-            <tr><td colspan="6" class="history-empty">No completed heats yet</td></tr>
+            <tr><td colspan="7" class="history-empty">No completed heats yet</td></tr>
           </tbody>
         </table>
       </div>
     </div>
 
+    <div class="card debug-card">
+      <div class="card__eyebrow">State machine (debug)</div>
+      <div class="debug-grid" id="debug-grid"></div>
+    </div>
+
+    <div class="card">
+      <div class="card__eyebrow">Events this heat</div>
+      <div class="debug-events" id="debug-events"></div>
+    </div>
+
   </aside>
 
 </main>
+
+<!-- Developer Debug Inspector Modal -->
+<div class="debug-modal-backdrop" id="debug-modal" style="display:none;" tabindex="-1">
+  <div class="debug-modal-container">
+    <div class="debug-modal-header">
+      <div class="debug-modal-header__left">
+        <span class="debug-modal-event-chip" id="modal-event-chip">EVENT</span>
+        <h3 class="debug-modal-title" id="modal-title">Process Detection Inspector</h3>
+        <span class="debug-modal-heat-tag" id="modal-heat-tag">Heat: —</span>
+      </div>
+      <div class="debug-modal-header__actions">
+        <a class="btn-modal-action" id="modal-download-raw" href="#" download target="_blank" title="Download original raw frame">
+          📥 Raw JPG
+        </a>
+        <a class="btn-modal-action" id="modal-download-ann" href="#" download target="_blank" title="Download frame with bounding boxes">
+          📥 Annotated JPG
+        </a>
+        <button type="button" class="btn-modal-action" id="modal-btn-copy-json" onclick="copyModalJson()" title="Copy raw JSON payload to clipboard">
+          📋 Copy JSON
+        </button>
+        <button type="button" class="debug-modal-close" onclick="closeDebugModal()" aria-label="Close dialog">&times;</button>
+      </div>
+    </div>
+
+    <div class="debug-modal-body">
+      <!-- Left Column: Frame Viewer -->
+      <div class="debug-modal-visual">
+        <div class="visual-mode-bar">
+          <div class="visual-tabs">
+            <button type="button" class="visual-tab is-active" id="vtab-annotated" onclick="setModalVisualMode('annotated')">
+              🎯 With Bounding Box
+            </button>
+            <button type="button" class="visual-tab" id="vtab-raw" onclick="setModalVisualMode('raw')">
+              📷 Without Bounding Box
+            </button>
+            <button type="button" class="visual-tab" id="vtab-split" onclick="setModalVisualMode('split')">
+              ↔️ Split Comparison
+            </button>
+          </div>
+          <div class="visual-hint">Click image to open high-res original</div>
+        </div>
+
+        <div class="visual-canvas">
+          <!-- Single View -->
+          <div class="visual-single-box" id="visual-single-box">
+            <a id="modal-img-link" href="#" target="_blank" title="Click to view full resolution image">
+              <img id="modal-main-img" src="" alt="Captured Frame" class="modal-frame-img">
+            </a>
+          </div>
+
+          <!-- Split View -->
+          <div class="visual-split-box" id="visual-split-box" style="display:none;">
+            <div class="split-col">
+              <div class="split-col__label">Without Bounding Box (Raw)</div>
+              <a id="modal-split-raw-link" href="#" target="_blank">
+                <img id="modal-split-raw-img" src="" alt="Raw frame" class="modal-split-img">
+              </a>
+            </div>
+            <div class="split-col">
+              <div class="split-col__label">With Bounding Box (Annotated)</div>
+              <a id="modal-split-ann-link" href="#" target="_blank">
+                <img id="modal-split-ann-img" src="" alt="Annotated frame" class="modal-split-img">
+              </a>
+            </div>
+          </div>
+        </div>
+
+        <!-- Telemetry Pill Bar -->
+        <div class="visual-pill-bar">
+          <span class="pill pill--blue" id="pill-dimensions">📏 0×0</span>
+          <span class="pill pill--amber" id="pill-detections">🎯 0 detections</span>
+          <span class="pill pill--cyan" id="pill-temp">🔥 —°C</span>
+          <span class="pill pill--muted" id="pill-timestamp">⏱️ —</span>
+        </div>
+      </div>
+
+      <!-- Right Column: Developer Inspector Tabs -->
+      <div class="debug-modal-inspect">
+        <div class="inspect-tabs">
+          <button type="button" class="inspect-tab is-active" id="itab-det" onclick="setModalInspectTab('det')">
+            Detections (<span id="inspect-det-count">0</span>)
+          </button>
+          <button type="button" class="inspect-tab" id="itab-state" onclick="setModalInspectTab('state')">
+            State &amp; Telemetry
+          </button>
+          <button type="button" class="inspect-tab" id="itab-json" onclick="setModalInspectTab('json')">
+            Debug JSON
+          </button>
+        </div>
+
+        <!-- Panel 1: Detections List -->
+        <div class="inspect-panel is-active" id="ipanel-det">
+          <div class="detections-container" id="modal-detections-container">
+            <div class="inspect-empty">No objects detected on this frame</div>
+          </div>
+        </div>
+
+        <!-- Panel 2: State & Diagnostics -->
+        <div class="inspect-panel" id="ipanel-state">
+          <div class="diag-table" id="modal-diag-table">
+            <!-- Dynamic Key-Value Pairs -->
+          </div>
+        </div>
+
+        <!-- Panel 3: Raw JSON Inspector -->
+        <div class="inspect-panel" id="ipanel-json">
+          <div class="json-box">
+            <div class="json-box__header">
+              <span>Complete Event Debug Metadata</span>
+              <button type="button" class="btn-copy-code" id="btn-copy-json-inner" onclick="copyModalJson()">
+                📋 Copy
+              </button>
+            </div>
+            <pre class="json-code" id="modal-json-pre"><code>{}</code></pre>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
 
 <script src="{{ url_for('static', filename='js/dashboard.js') }}"></script>
 </body>

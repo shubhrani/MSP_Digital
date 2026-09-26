@@ -62,6 +62,18 @@ EVENT_NAMESPACE = uuid.UUID("6f1f4a58-3c7a-5b21-9a1e-7c2d0e5b4a90")
 def make_event_key(heat_id, ordinal, event_name):
     return str(uuid.uuid5(EVENT_NAMESPACE, f"{heat_id}|{ordinal}|{event_name}"))
 
+
+def parse_furnace_stand(furnace_id):
+    """Split e.g. '4/2' or '4-2' into ('4', '2'). Defaults to (furnace_id, '')."""
+    if not furnace_id:
+        return ("", "")
+    s = str(furnace_id)
+    for sep in ("/", "-", "_"):
+        if sep in s:
+            parts = s.split(sep, 1)
+            return (parts[0], parts[1])
+    return (s, "")
+
 # Preference order when config.SQL_DRIVER is not set explicitly.
 _DRIVER_PREFERENCE = (
     "ODBC Driver 18 for SQL Server",
@@ -153,42 +165,52 @@ IF SCHEMA_ID('{config.SQL_SCHEMA}') IS NULL
         f"""
 IF OBJECT_ID('{_HEATS_NAME}', 'U') IS NULL
 CREATE TABLE {HEATS} (
-    HeatId          VARCHAR(64)    NOT NULL CONSTRAINT PK_Heats PRIMARY KEY,
-    FurnaceId       VARCHAR(16)    NOT NULL CONSTRAINT DF_Heats_FurnaceId DEFAULT (''),
-    HeatNumber      INT            NULL,
-    StartTime       DATETIME2(3)   NULL,
-    EndTime         DATETIME2(3)   NULL,
-    DurationMinutes DECIMAL(10, 2) NULL,
-    TiltCount       INT            NOT NULL CONSTRAINT DF_Heats_TiltCount DEFAULT (0),
-    Status          VARCHAR(20)    NOT NULL CONSTRAINT DF_Heats_Status DEFAULT ('IN_PROGRESS'),
-    CsvFile         VARCHAR(255)   NULL,
-    SourceHost      VARCHAR(128)   NULL,
-    CreatedAt       DATETIME2(3)   NOT NULL CONSTRAINT DF_Heats_CreatedAt DEFAULT (SYSDATETIME()),
-    UpdatedAt       DATETIME2(3)   NOT NULL CONSTRAINT DF_Heats_UpdatedAt DEFAULT (SYSDATETIME())
+    heat_id          VARCHAR(64)   NOT NULL CONSTRAINT PK_Heats PRIMARY KEY,
+    furnace          VARCHAR(50)   NULL,
+    stand            VARCHAR(50)   NULL,
+    heat_number      INT           NULL,
+    heat_status      VARCHAR(20)   NULL CONSTRAINT DF_Heats_heat_status DEFAULT ('IN_PROGRESS'),
+    heat_start_time  DATETIME      NULL,
+    heat_end_time    DATETIME      NULL,
+    heat_duration    VARCHAR(50)   NULL,
+    scrap_duration   VARCHAR(50)   NULL,
+    sponge_duration  VARCHAR(50)   NULL,
+    tapping_duration VARCHAR(50)   NULL,
+    heat_event_match VARCHAR(5)    NULL,
+    position         VARCHAR(20)   NULL,
+    operation_status VARCHAR(20)   NULL,
+    timeline_json    VARCHAR(MAX)  NULL,
+    detected_classes VARCHAR(MAX)  NULL,
+    insertion_time   DATETIME      NULL CONSTRAINT DF_Heats_insertion_time DEFAULT (SYSDATETIME()),
+    updated_time     DATETIME      NULL CONSTRAINT DF_Heats_updated_time DEFAULT (SYSDATETIME()),
+    FurnaceId        VARCHAR(16)   NOT NULL CONSTRAINT DF_Heats_FurnaceId DEFAULT ('')
 );
 """,
         # -- HeatEvents: one row per stage / tilt ------------------------
         f"""
 IF OBJECT_ID('{_EVENTS_NAME}', 'U') IS NULL
 CREATE TABLE {EVENTS} (
-    EventId         BIGINT IDENTITY(1,1) NOT NULL CONSTRAINT PK_HeatEvents PRIMARY KEY,
-    EventKey        CHAR(36)       NOT NULL,
-    HeatId          VARCHAR(64)    NOT NULL,
-    FurnaceId       VARCHAR(16)    NOT NULL CONSTRAINT DF_HeatEvents_FurnaceId DEFAULT (''),
-    HeatNumber      INT            NULL,
-    EventName       VARCHAR(64)    NOT NULL,
-    StartTime       DATETIME2(3)   NULL,
-    EndTime         DATETIME2(3)   NULL,
-    DurationMinutes DECIMAL(10, 2) NULL,
-    TiltNumber      INT            NULL,
-    Note            VARCHAR(255)   NULL,
-    SourceHost      VARCHAR(128)   NULL,
-    CreatedAt       DATETIME2(3)   NOT NULL CONSTRAINT DF_HeatEvents_CreatedAt DEFAULT (SYSDATETIME())
+    id               INT IDENTITY(1,1) NOT NULL CONSTRAINT PK_HeatEvents PRIMARY KEY,
+    heat_id          VARCHAR(64)       NULL,
+    event_id         VARCHAR(64)       NULL,
+    cross_event_id   VARCHAR(64)       NULL,
+    event_name       VARCHAR(100)      NULL,
+    cross_event_name VARCHAR(100)      NULL,
+    start_time       DATETIME          NULL,
+    end_time         DATETIME          NULL,
+    duration         VARCHAR(50)       NULL,
+    status           VARCHAR(20)       NULL,
+    confidence       VARCHAR(20)       NULL,
+    sop_duration     VARCHAR(50)       NULL,
+    alarms           VARCHAR(MAX)      NULL,
+    original_frame   VARBINARY(MAX)    NULL,
+    plotted_image    VARBINARY(MAX)    NULL,
+    created_at       DATETIME          NULL CONSTRAINT DF_HeatEvents_created_at DEFAULT (SYSDATETIME()),
+    updated_at       DATETIME          NULL CONSTRAINT DF_HeatEvents_updated_at DEFAULT (SYSDATETIME()),
+    FurnaceId        VARCHAR(16)       NOT NULL CONSTRAINT DF_HeatEvents_FurnaceId DEFAULT ('')
 );
 """,
-        # -- migration: add FurnaceId to tables created before this
-        #    column existed, so upgrading in place doesn't require a
-        #    manual ALTER TABLE against a live database -----------------
+        # -- migration: ensure FurnaceId exists -------------------------
         f"""
 IF OBJECT_ID('{_HEATS_NAME}', 'U') IS NOT NULL
    AND NOT EXISTS (SELECT 1 FROM sys.columns
@@ -204,117 +226,115 @@ IF OBJECT_ID('{_EVENTS_NAME}', 'U') IS NOT NULL
         # -- indexes -----------------------------------------------------
         f"""
 IF NOT EXISTS (SELECT 1 FROM sys.indexes
-               WHERE name = 'UX_HeatEvents_EventKey'
+               WHERE name = 'UX_HeatEvents_event_id'
                  AND object_id = OBJECT_ID('{_EVENTS_NAME}'))
-    CREATE UNIQUE INDEX UX_HeatEvents_EventKey ON {EVENTS} (EventKey);
+    CREATE UNIQUE INDEX UX_HeatEvents_event_id ON {EVENTS} (event_id) WHERE event_id IS NOT NULL;
 """,
         f"""
 IF NOT EXISTS (SELECT 1 FROM sys.indexes
                WHERE name = 'IX_Heats_FurnaceId'
                  AND object_id = OBJECT_ID('{_HEATS_NAME}'))
-    CREATE INDEX IX_Heats_FurnaceId ON {HEATS} (FurnaceId, StartTime) INCLUDE (Status, TiltCount);
+    CREATE INDEX IX_Heats_FurnaceId ON {HEATS} (FurnaceId, heat_start_time);
 """,
         f"""
 IF NOT EXISTS (SELECT 1 FROM sys.indexes
                WHERE name = 'IX_HeatEvents_FurnaceId'
                  AND object_id = OBJECT_ID('{_EVENTS_NAME}'))
-    CREATE INDEX IX_HeatEvents_FurnaceId ON {EVENTS} (FurnaceId, HeatId);
+    CREATE INDEX IX_HeatEvents_FurnaceId ON {EVENTS} (FurnaceId, heat_id);
 """,
         f"""
 IF NOT EXISTS (SELECT 1 FROM sys.indexes
-               WHERE name = 'IX_HeatEvents_HeatId'
+               WHERE name = 'IX_HeatEvents_heat_id'
                  AND object_id = OBJECT_ID('{_EVENTS_NAME}'))
-    CREATE INDEX IX_HeatEvents_HeatId ON {EVENTS} (HeatId)
-        INCLUDE (EventName, StartTime, EndTime, DurationMinutes, TiltNumber);
+    CREATE INDEX IX_HeatEvents_heat_id ON {EVENTS} (heat_id)
+        INCLUDE (event_name, start_time, end_time, duration);
 """,
         f"""
 IF NOT EXISTS (SELECT 1 FROM sys.indexes
-               WHERE name = 'IX_HeatEvents_Name_Start'
+               WHERE name = 'IX_HeatEvents_name_start'
                  AND object_id = OBJECT_ID('{_EVENTS_NAME}'))
-    CREATE INDEX IX_HeatEvents_Name_Start ON {EVENTS} (EventName, StartTime);
+    CREATE INDEX IX_HeatEvents_name_start ON {EVENTS} (event_name, start_time);
 """,
         f"""
 IF NOT EXISTS (SELECT 1 FROM sys.indexes
-               WHERE name = 'IX_Heats_StartTime'
+               WHERE name = 'IX_Heats_start_time'
                  AND object_id = OBJECT_ID('{_HEATS_NAME}'))
-    CREATE INDEX IX_Heats_StartTime ON {HEATS} (StartTime) INCLUDE (Status, TiltCount);
+    CREATE INDEX IX_Heats_start_time ON {HEATS} (heat_start_time);
 """,
-        # -- vw_HeatAnalysis: the one object an analyst needs ------------
+        # -- vw_HeatAnalysis: 30 columns matching production -------------
         f"""
 CREATE OR ALTER VIEW {SCHEMA}.[vw_HeatAnalysis] AS
 WITH stages AS (
     SELECT
-        HeatId,
-        MIN(CASE WHEN EventName = 'scrap_charging'  THEN StartTime END) AS ScrapStart,
-        MAX(CASE WHEN EventName = 'scrap_charging'  THEN EndTime   END) AS ScrapEnd,
-        SUM(CASE WHEN EventName = 'scrap_charging'  THEN DurationMinutes END) AS ScrapMinutes,
-        MIN(CASE WHEN EventName = 'sponge_charging' THEN StartTime END) AS SpongeStart,
-        MAX(CASE WHEN EventName = 'sponge_charging' THEN EndTime   END) AS SpongeEnd,
-        SUM(CASE WHEN EventName = 'sponge_charging' THEN DurationMinutes END) AS SpongeMinutes,
-        MIN(CASE WHEN EventName = 'tapping'         THEN StartTime END) AS TappingStart,
-        MAX(CASE WHEN EventName = 'tapping'         THEN EndTime   END) AS TappingEnd,
-        SUM(CASE WHEN EventName = 'tapping'         THEN DurationMinutes END) AS TappingMinutes,
-        SUM(CASE WHEN EventName = 'tilt' THEN 1 ELSE 0 END)                  AS TiltEvents,
-        SUM(CASE WHEN EventName = 'tilt' THEN DurationMinutes ELSE 0 END)    AS TiltMinutes,
-        SUM(CASE WHEN EventName = 'tilt_ignored_cooldown' THEN 1 ELSE 0 END) AS TiltsSuppressed,
-        MAX(CASE WHEN EventName LIKE '%[_]unknown' THEN 1 ELSE 0 END)        AS HasUnknownStage
+        heat_id,
+        MIN(CASE WHEN event_name = 'scrap_charging'  THEN start_time END) AS ScrapStart,
+        MAX(CASE WHEN event_name = 'scrap_charging'  THEN end_time   END) AS ScrapEnd,
+        SUM(CASE WHEN event_name = 'scrap_charging'  THEN TRY_CAST(duration AS DECIMAL(10,2)) END) AS ScrapMinutes,
+        MIN(CASE WHEN event_name = 'sponge_charging' THEN start_time END) AS SpongeStart,
+        MAX(CASE WHEN event_name = 'sponge_charging' THEN end_time   END) AS SpongeEnd,
+        SUM(CASE WHEN event_name = 'sponge_charging' THEN TRY_CAST(duration AS DECIMAL(10,2)) END) AS SpongeMinutes,
+        MIN(CASE WHEN event_name = 'tapping'         THEN start_time END) AS TappingStart,
+        MAX(CASE WHEN event_name = 'tapping'         THEN end_time   END) AS TappingEnd,
+        SUM(CASE WHEN event_name = 'tapping'         THEN TRY_CAST(duration AS DECIMAL(10,2)) END) AS TappingMinutes,
+        SUM(CASE WHEN event_name = 'tilt' THEN 1 ELSE 0 END)                                      AS TiltCount,
+        SUM(CASE WHEN event_name = 'tilt' THEN TRY_CAST(duration AS DECIMAL(10,2)) ELSE 0 END)    AS TiltMinutes,
+        SUM(CASE WHEN event_name = 'tilt_ignored_cooldown' THEN 1 ELSE 0 END)                     AS TiltsSuppressed,
+        MAX(CASE WHEN event_name LIKE '%[_]unknown' THEN 1 ELSE 0 END)                            AS HasUnknownStage
     FROM {EVENTS}
-    GROUP BY HeatId
+    GROUP BY heat_id
 )
 SELECT
-    h.HeatId,
-    h.FurnaceId,
-    h.HeatNumber,
-    h.Status,
-    h.StartTime,
-    h.EndTime,
-    h.DurationMinutes                             AS HeatMinutes,
-    CAST(h.StartTime AS DATE)                     AS HeatDate,
-    DATEPART(HOUR, h.StartTime)                   AS HeatStartHour,
-    DATENAME(WEEKDAY, h.StartTime)                AS HeatWeekday,
-    s.ScrapStart,  s.ScrapEnd,  s.ScrapMinutes,
-    s.SpongeStart, s.SpongeEnd, s.SpongeMinutes,
-    s.TappingStart, s.TappingEnd, s.TappingMinutes,
-    h.TiltCount,
+    h.heat_id                                     AS HeatId,
+    h.FurnaceId                                   AS FurnaceId,
+    h.heat_number                                 AS HeatNumber,
+    ISNULL(h.heat_status, 'IN_PROGRESS')          AS Status,
+    h.heat_start_time                             AS StartTime,
+    h.heat_end_time                               AS EndTime,
+    TRY_CAST(h.heat_duration AS DECIMAL(10,2))    AS HeatMinutes,
+    CAST(h.heat_start_time AS DATE)               AS HeatDate,
+    DATEPART(HOUR, h.heat_start_time)             AS HeatStartHour,
+    DATENAME(WEEKDAY, h.heat_start_time)          AS HeatWeekday,
+    s.ScrapStart, s.ScrapEnd,
+    COALESCE(s.ScrapMinutes, TRY_CAST(h.scrap_duration AS DECIMAL(10,2)))       AS ScrapMinutes,
+    s.SpongeStart, s.SpongeEnd,
+    COALESCE(s.SpongeMinutes, TRY_CAST(h.sponge_duration AS DECIMAL(10,2)))     AS SpongeMinutes,
+    s.TappingStart, s.TappingEnd,
+    COALESCE(s.TappingMinutes, TRY_CAST(h.tapping_duration AS DECIMAL(10,2)))   AS TappingMinutes,
+    ISNULL(s.TiltCount, 0)                        AS TiltCount,
     ISNULL(s.TiltMinutes, 0)                      AS TiltMinutes,
     ISNULL(s.TiltsSuppressed, 0)                  AS TiltsSuppressed,
-    -- Anything not accounted for by the three stages (gaps, idle time
-    -- inside the heat) - useful for spotting unexplained losses.
-    CASE WHEN h.DurationMinutes IS NOT NULL
-         THEN h.DurationMinutes
-              - ISNULL(s.ScrapMinutes, 0)
-              - ISNULL(s.SpongeMinutes, 0)
-              - ISNULL(s.TappingMinutes, 0)
+    CASE WHEN TRY_CAST(h.heat_duration AS DECIMAL(10,2)) IS NOT NULL
+         THEN TRY_CAST(h.heat_duration AS DECIMAL(10,2))
+              - ISNULL(COALESCE(s.ScrapMinutes, TRY_CAST(h.scrap_duration AS DECIMAL(10,2))), 0)
+              - ISNULL(COALESCE(s.SpongeMinutes, TRY_CAST(h.sponge_duration AS DECIMAL(10,2))), 0)
+              - ISNULL(COALESCE(s.TappingMinutes, TRY_CAST(h.tapping_duration AS DECIMAL(10,2))), 0)
     END                                           AS UnaccountedMinutes,
-    -- Flags against the plant's own reference ranges.
-    CASE WHEN s.ScrapMinutes   BETWEEN  20 AND  30 THEN 1 ELSE 0 END AS ScrapWithinExpected,
-    CASE WHEN s.SpongeMinutes  BETWEEN  60 AND 150 THEN 1 ELSE 0 END AS SpongeWithinExpected,
-    CASE WHEN s.TappingMinutes BETWEEN  10 AND  20 THEN 1 ELSE 0 END AS TappingWithinExpected,
-    -- 1 when one or more stages were never observed (app started
-    -- mid-heat), so these rows can be excluded from averages.
+    CASE WHEN COALESCE(s.ScrapMinutes, TRY_CAST(h.scrap_duration AS DECIMAL(10,2))) <= 45 THEN 1 ELSE 0 END AS ScrapWithinExpected,
+    CASE WHEN COALESCE(s.SpongeMinutes, TRY_CAST(h.sponge_duration AS DECIMAL(10,2))) BETWEEN 90 AND 120 THEN 1 ELSE 0 END AS SpongeWithinExpected,
+    CASE WHEN COALESCE(s.TappingMinutes, TRY_CAST(h.tapping_duration AS DECIMAL(10,2))) BETWEEN 10 AND 20 THEN 1 ELSE 0 END AS TappingWithinExpected,
     ISNULL(s.HasUnknownStage, 0)                  AS HasUnknownStage,
-    h.CsvFile,
-    h.SourceHost,
-    h.UpdatedAt
+    CAST(NULL AS VARCHAR(255))                    AS CsvFile,
+    CAST(NULL AS VARCHAR(128))                    AS SourceHost,
+    ISNULL(h.updated_time, SYSDATETIME())         AS UpdatedAt
 FROM {HEATS} h
-LEFT JOIN stages s ON s.HeatId = h.HeatId;
+LEFT JOIN stages s ON s.heat_id = h.heat_id;
 """,
-        # -- vw_HeatDaily: shift/day rollup ------------------------------
+        # -- vw_HeatDaily: 12 columns ------------------------------------
         f"""
 CREATE OR ALTER VIEW {SCHEMA}.[vw_HeatDaily] AS
 SELECT
     FurnaceId,
     HeatDate,
-    COUNT(*)                        AS HeatsCompleted,
+    COUNT(*)                                  AS HeatsCompleted,
     CAST(AVG(HeatMinutes)    AS DECIMAL(10,2)) AS AvgHeatMinutes,
     CAST(MIN(HeatMinutes)    AS DECIMAL(10,2)) AS MinHeatMinutes,
     CAST(MAX(HeatMinutes)    AS DECIMAL(10,2)) AS MaxHeatMinutes,
     CAST(AVG(ScrapMinutes)   AS DECIMAL(10,2)) AS AvgScrapMinutes,
     CAST(AVG(SpongeMinutes)  AS DECIMAL(10,2)) AS AvgSpongeMinutes,
     CAST(AVG(TappingMinutes) AS DECIMAL(10,2)) AS AvgTappingMinutes,
-    SUM(TiltCount)                  AS TotalTilts,
+    SUM(TiltCount)                            AS TotalTilts,
     CAST(AVG(CAST(TiltCount AS DECIMAL(10,2))) AS DECIMAL(10,2)) AS AvgTiltsPerHeat,
-    SUM(TiltsSuppressed)            AS TotalTiltsSuppressed
+    SUM(TiltsSuppressed)                      AS TotalTiltsSuppressed
 FROM {SCHEMA}.[vw_HeatAnalysis]
 WHERE Status = 'COMPLETE' AND HasUnknownStage = 0
 GROUP BY FurnaceId, HeatDate;
@@ -329,31 +349,38 @@ GROUP BY FurnaceId, HeatDate;
 # writer thread so the race MERGE would guard against can't happen here.
 SQL_UPSERT_HEAT_START = f"""
 UPDATE {HEATS}
-   SET FurnaceId = ?, HeatNumber = ?, StartTime = ?, CsvFile = ?, SourceHost = ?, UpdatedAt = SYSDATETIME()
- WHERE HeatId = ?;
+   SET furnace = ?, stand = ?, FurnaceId = ?, heat_number = ?, heat_status = 'IN_PROGRESS',
+       heat_start_time = ?, updated_time = SYSDATETIME()
+ WHERE heat_id = ?;
 IF @@ROWCOUNT = 0
-INSERT INTO {HEATS} (HeatId, FurnaceId, HeatNumber, StartTime, Status, CsvFile, SourceHost)
-VALUES (?, ?, ?, ?, 'IN_PROGRESS', ?, ?);
+INSERT INTO {HEATS} (heat_id, furnace, stand, FurnaceId, heat_number, heat_status,
+                     heat_start_time, insertion_time, updated_time)
+VALUES (?, ?, ?, ?, ?, 'IN_PROGRESS', ?, SYSDATETIME(), SYSDATETIME());
 """
 
 SQL_UPSERT_HEAT_END = f"""
 UPDATE {HEATS}
-   SET FurnaceId = ?, EndTime = ?, DurationMinutes = ?, TiltCount = ?, Status = ?, UpdatedAt = SYSDATETIME()
- WHERE HeatId = ?;
+   SET furnace = ?, stand = ?, FurnaceId = ?, heat_number = ?, heat_status = ?,
+       heat_start_time = COALESCE(heat_start_time, ?), heat_end_time = ?,
+       heat_duration = ?, scrap_duration = ?, sponge_duration = ?, tapping_duration = ?,
+       updated_time = SYSDATETIME()
+ WHERE heat_id = ?;
 IF @@ROWCOUNT = 0
-INSERT INTO {HEATS} (HeatId, FurnaceId, HeatNumber, StartTime, EndTime, DurationMinutes,
-                     TiltCount, Status, CsvFile, SourceHost)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+INSERT INTO {HEATS} (heat_id, furnace, stand, FurnaceId, heat_number, heat_status,
+                     heat_start_time, heat_end_time, heat_duration, scrap_duration,
+                     sponge_duration, tapping_duration, insertion_time, updated_time)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, SYSDATETIME(), SYSDATETIME());
 """
 
 SQL_UPSERT_EVENT = f"""
 UPDATE {EVENTS}
-   SET StartTime = ?, EndTime = ?, DurationMinutes = ?, TiltNumber = ?, Note = ?, SourceHost = ?
- WHERE EventKey = ?;
+   SET heat_id = ?, FurnaceId = ?, event_name = ?, start_time = ?, end_time = ?,
+       duration = ?, status = ?, updated_at = SYSDATETIME()
+ WHERE event_id = ?;
 IF @@ROWCOUNT = 0
-INSERT INTO {EVENTS} (EventKey, HeatId, FurnaceId, HeatNumber, EventName, StartTime, EndTime,
-                      DurationMinutes, TiltNumber, Note, SourceHost)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+INSERT INTO {EVENTS} (event_id, heat_id, FurnaceId, event_name, start_time, end_time,
+                      duration, status, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, SYSDATETIME(), SYSDATETIME());
 """
 
 
@@ -391,6 +418,16 @@ def _int(value):
         return int(float(value))
     except (TypeError, ValueError):
         return None
+
+
+def _str_duration(value):
+    """Format duration into a string representation for VARCHAR(50), or None."""
+    if value in (None, ""):
+        return None
+    try:
+        return f"{float(value):.2f}"
+    except (TypeError, ValueError):
+        return str(value)
 
 
 # ---------------------------------------------------------------------------
@@ -470,8 +507,10 @@ class SqlRecorder:
         })
 
     def record_heat_completed(self, heat_id, heat_number, start_time, end_time,
-                              duration_minutes, tilt_count, status="COMPLETE",
-                              csv_file=None, furnace_id=None):
+                              duration_minutes, tilt_count=0, status="COMPLETE",
+                              csv_file=None, furnace_id=None,
+                              scrap_duration=None, sponge_duration=None,
+                              tapping_duration=None):
         self._enqueue({
             "op": "heat_end",
             "heat_id": heat_id,
@@ -480,6 +519,9 @@ class SqlRecorder:
             "start_time": _iso(start_time),
             "end_time": _iso(end_time),
             "duration_minutes": duration_minutes,
+            "scrap_duration": scrap_duration,
+            "sponge_duration": sponge_duration,
+            "tapping_duration": tapping_duration,
             "tilt_count": tilt_count,
             "status": status,
             "csv_file": csv_file,
@@ -518,10 +560,12 @@ class SqlRecorder:
 
     def status(self):
         with self._state_lock:
+            slots = getattr(config, "FURNACE_SLOTS", {})
             return {
                 "enabled": self.enabled,
                 "connected": self._connected,
                 "furnace_id": config.FURNACE_ID,
+                "furnace_slots": {slug: cfg.get("furnace_id") for slug, cfg in slots.items()},
                 "server": config.SQL_SERVER if self.enabled else None,
                 "database": config.SQL_DATABASE if self.enabled else None,
                 "driver": detect_driver() if self.enabled else None,
@@ -591,55 +635,58 @@ class SqlRecorder:
             if op == "heat_start":
                 heat_id = payload["heat_id"]
                 furnace_id = payload.get("furnace_id") or config.FURNACE_ID
+                furnace, stand = parse_furnace_stand(furnace_id)
                 number = _int(payload.get("heat_number"))
                 start = _dt(payload.get("start_time"))
-                csv_file = payload.get("csv_file")
-                host = payload.get("source_host")
                 cursor.execute(SQL_UPSERT_HEAT_START,
-                               furnace_id, number, start, csv_file, host, heat_id,
-                               heat_id, furnace_id, number, start, csv_file, host)
+                               # UPDATE (6 params)
+                               furnace, stand, furnace_id, number, start, heat_id,
+                               # INSERT (6 params)
+                               heat_id, furnace, stand, furnace_id, number, start)
 
             elif op == "heat_end":
                 heat_id = payload["heat_id"]
                 furnace_id = payload.get("furnace_id") or config.FURNACE_ID
+                furnace, stand = parse_furnace_stand(furnace_id)
                 number = _int(payload.get("heat_number"))
                 start = _dt(payload.get("start_time"))
                 end = _dt(payload.get("end_time"))
-                duration = _num(payload.get("duration_minutes"))
-                tilts = _int(payload.get("tilt_count")) or 0
+                duration_str = _str_duration(payload.get("duration_minutes"))
+                scrap_dur_str = _str_duration(payload.get("scrap_duration"))
+                sponge_dur_str = _str_duration(payload.get("sponge_duration"))
+                tapping_dur_str = _str_duration(payload.get("tapping_duration"))
                 status = payload.get("status") or "COMPLETE"
-                csv_file = payload.get("csv_file")
-                host = payload.get("source_host")
                 cursor.execute(SQL_UPSERT_HEAT_END,
-                               furnace_id, end, duration, tilts, status, heat_id,
-                               heat_id, furnace_id, number, start, end, duration, tilts,
-                               status, csv_file, host)
+                               # UPDATE (12 params)
+                               furnace, stand, furnace_id, number, status, start, end,
+                               duration_str, scrap_dur_str, sponge_dur_str, tapping_dur_str, heat_id,
+                               # INSERT (12 params)
+                               heat_id, furnace, stand, furnace_id, number, status, start, end,
+                               duration_str, scrap_dur_str, sponge_dur_str, tapping_dur_str)
 
             elif op == "event":
                 key = payload["event_key"]
+                heat_id = payload["heat_id"]
+                furnace_id = payload.get("furnace_id") or config.FURNACE_ID
+                event_name = payload["event_name"]
                 start = _dt(payload.get("start_time"))
                 end = _dt(payload.get("end_time"))
-                duration = _num(payload.get("duration_minutes"))
-                tilt_number = _int(payload.get("tilt_number"))
-                note = payload.get("note") or None
-                host = payload.get("source_host")
-                furnace_id = payload.get("furnace_id") or config.FURNACE_ID
-                number = _int(payload.get("heat_number"))
+                duration_str = _str_duration(payload.get("duration_minutes"))
+                status = payload.get("status") or ("COMPLETED" if end is not None else "IN_PROGRESS")
                 
                 cursor.execute(SQL_UPSERT_EVENT,
-                               # UPDATE
-                               start, end, duration, tilt_number, note, host, key,
-                               # INSERT
-                               key, payload["heat_id"], furnace_id, number, payload["event_name"],
-                               start, end, duration, tilt_number, note, host)
+                               # UPDATE (8 params)
+                               heat_id, furnace_id, event_name, start, end, duration_str, status, key,
+                               # INSERT (8 params)
+                               key, heat_id, furnace_id, event_name, start, end, duration_str, status)
 
             elif op == "heat_delete":
                 heat_id = payload["heat_id"]
                 # HeatEvents first: it has a logical (unenforced) FK to
                 # Heats, and deleting the parent row first would just leave
                 # its child rows orphaned instead of gone.
-                cursor.execute(f"DELETE FROM {EVENTS} WHERE HeatId = ?", heat_id)
-                cursor.execute(f"DELETE FROM {HEATS} WHERE HeatId = ?", heat_id)
+                cursor.execute(f"DELETE FROM {EVENTS} WHERE heat_id = ?", heat_id)
+                cursor.execute(f"DELETE FROM {HEATS} WHERE heat_id = ?", heat_id)
 
             else:
                 logger.warning("Ignoring unknown SQL payload op: %r", op)

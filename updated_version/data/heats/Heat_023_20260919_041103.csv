@@ -1,0 +1,4 @@
+event,start_time,end_time,duration_minutes,tilt_number,note
+scrap_charging,2026-09-19T04:11:03.511980,2026-09-19T04:37:54.151045,26.84,,
+sponge_charging,2026-09-19T04:37:54.151045,2026-09-19T04:48:20.792873,10.44,,ladle moving with molten iron
+tapping,2026-09-19T04:48:20.792873,2026-09-19T04:48:22.186919,0.02,,scrap feeding detected

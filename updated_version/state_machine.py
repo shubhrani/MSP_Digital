@@ -1,151 +1,68 @@
 """
 HeatStateMachine
 ----------------
-Turns a stream of *confirmed* class-name detections into the furnace process
+Turns a stream of *confirmed* class-ID detections into the furnace process
 timeline described by the plant: scrap charging -> sponge charging ->
 tapping, plus a tilt counter for furnace movements that turn out NOT to be
 tapping.
 
-Logic (matches the classes by their text names, not numeric IDs - see the
-CLS_* constants below for the exact strings used. Matching on names instead
-of numbers means this logic keeps working even if the model is retrained
-and its classes get renumbered, as long as the class *names* stay the same):
+Process sequence (38-class model + InfluxDB PYRO temperature):
 
-  Scrap charging starts (new heat begins) when EITHER of:
-    - magnet_feeding_scrap is detected, or
-    - magnet_moving_withscrap is detected positioned just above
-      furnace_position_normal's box in the same frame (a derived signal -
-      see CLS_MAGNET_ABOVE_FURNACE / camera_worker.py /
-      detector.magnet_above_furnace_normal() and
-      config.MAGNET_ABOVE_FURNACE_* for the spatial thresholds).
-  If either fires while the *previous* heat is still in TAPPING, that heat
-  is closed out immediately (see "Ending a heat" below) and the new heat
-  starts from this same moment.
-  Scrap charging cannot run longer than SCRAP_CHARGING_MAX_MINUTES (40 min
-  by default) - see "Hard time caps" below.
+  Stage 1: Scrap Charging (Heat Start)
+  16 magnet_moving_with_scrap / 17 magnet_feeding_scrap / 19 furnace_operation_scrapfeeding
+    -> Scrap charging starts (new heat begins).
+       If seen while previous heat is in TAPPING, that heat is closed out
+       immediately and the new heat starts from this same moment.
+    -> Maximum duration: 45 minutes. If no sponge class appears by 45 minutes,
+       automatically transitions to sponge charging at scrap_start + 45 min.
 
-  spange_feeder_onfurnace OR spange_feeder_engaged -> scrap charging ends,
-  sponge charging starts. Sponge charging cannot run longer than
-  SPONGE_CHARGING_MAX_MINUTES (140 min by default) - see "Hard time caps"
-  below.
+  Stage 2: Sponge Iron Charging
+  6 sponge_feeder_engaged / 10 sponge_feeder_onfurnace /
+  35 magnet_moving_with_sponge / 37 magnet_feeding_sponge
+    -> Scrap charging ends, sponge charging starts in the SAME heat.
+    -> Reference duration: 90-120 minutes.
 
-  Tapping starts EITHER of two ways (no other signal starts tapping):
-    - furnace_position_tilding is held open for more than
-      TILT_TO_TAPPING_MINUTES (3.5 min) without furnace_position_normal
-      confirming it was just a tilt -> promoted straight into tapping,
-      backdated to when the tilt itself began (see "Tilt duration ->
-      tapping promotion" below), or
-    - furnace_position_tilding is detected once sponge charging has
-      already run for SPONGE_FAST_TRACK_MINUTES (130 min) or more -> taken
-      as tapping starting immediately, no need to also wait out
-      TILT_TO_TAPPING_MINUTES first (the "fast track").
+  Furnace Movement & Tapping vs. Tilt Decision:
+  - Movement cycle: 2 (position up), 8 (bottom visible partially),
+    18 (tilting), or 24 (bottom visible completely) starts a movement cycle
+    (furnace_moving = True). Returning to 9 (normal) ends the movement cycle.
+  - Tilt counting: Returning to normal counts as a tilt unless it occurs
+    within 45 seconds of the previous counted tilt's end (TILT_MIN_GAP = 45s).
+  - Tapping check: Only class 24 (furnace_bottom_visiblecompletely) opens a
+    tapping candidate window lasting up to 5 minutes (TAPPING_CANDIDATE_WINDOW = 5m).
+  - Tapping confirmation:
+    * Ladle moving with melt iron (class 25) during an active check confirms tapping.
+    * Or a PYRO value change on either furnace monitor confirms tapping.
+    * Tapping start time is backdated with a 90-second pre-roll before class 24
+      (tap_candidate_start - 90s, clamped to sponge_start).
+    * When tapping is confirmed, the heat completes immediately.
+  - Candidate expiration: If 5 minutes pass with no ladle or PYRO change, the candidate
+    expires and any pending movement resolves as a tilt.
 
-  Watching for tapping while sponge charging is in progress (under the
-  130-minute fast-track threshold):
-  furnace_position_tilding    -> furnace leaves "normal" position. We
-                                  don't yet know if this is the start of
-                                  tapping or just an inspection tilt, so
-                                  the app starts "watching".
-  furnace_position_normal     -> furnace is back to normal position while
-                                  being watched -> this was just a tilt
-                                  (not tapping). tilt_count += 1, and the
-                                  app keeps waiting inside sponge charging.
+  Heat Completion (Tapping -> IDLE):
+    - 9 (furnace_position_normal) is detected while TAPPING, or
+    - 15 minutes have passed since tapping started (safety timeout cap), or
+    - 16/17/19 (scrap feeding) detected (next heat begins immediately).
 
-  furnace_position_normal     -> (while TAPPING) tapping has ended and the
-                                  heat is complete.
+  Active-Fire Watchdog:
+  3 furnace_operation_activefire -> Heartbeat signal; confirmed sightings
+       reset the active fire timeout clock. If no active fire is
+       seen for the configured timeout (5 min) during an active heat, the heat is aborted/purged.
 
-  Starting mid-process (app restarted, or first launched, while a heat is
-  already underway): if the first thing seen while IDLE is anything other
-  than magnet_feeding_scrap / magnet_moving_withscrap-above-furnace, a
-  heat is assumed to already be in progress and is picked up immediately
-  from whichever stage that implies, rather than sitting in IDLE waiting
-  indefinitely for the next scrap charging. See
-  MID_PROCESS_SPONGE_CLASS_NAMES below - there's no class that on its own
-  definitively means "tapping already in progress", so a mid-process
-  pickup always starts from SPONGE_CHARGING and lets the normal tilting
-  rules above sort out whether tapping has actually started.
-  The skipped earlier stage(s) are logged with an unknown start/duration
-  instead of a guessed one.
-
-  Ending a heat (tapping -> IDLE), whichever happens first:
-    - furnace_position_normal is detected while TAPPING, or
-    - TAPPING_MAX_MINUTES (7 min) have passed since tapping started with
-      no furnace_position_normal detected - see "Hard time caps" below, or
-    - magnet_feeding_scrap (or the magnet-above-furnace signal) is
-      detected (this also means the *next* heat's scrap charging has
-      begun, so a new heat starts immediately from this same moment).
-
-  Tilt duration -> tapping promotion (on top of the rules above):
-  While the app is "watching" a tilt (see furnace_position_tilding above,
-  under-130-minute case), if the furnace stays out of the normal position
-  for more than TILT_TO_TAPPING_MINUTES (3.5 min) *without*
-  furnace_position_normal ever confirming it was just a tilt, the watch is
-  promoted straight into tapping - same as the 130-minute fast track, just
-  triggered by how long this one tilt has run instead of by total
-  sponge-charging time. This is a pure time-based check (see check_timeouts
-  / _check_timeouts_locked below), so it fires even if no further
-  detection ever arrives for that furnace movement.
-
-  Hard time caps (independent of every rule above):
-    - If scrap charging has been running for SCRAP_CHARGING_MAX_MINUTES
-      (40 min) with no sponge_charging_start signal yet, the state machine
-      forces the transition into sponge charging anyway, logged with a
-      note, backdated to the cap being hit.
-    - If sponge charging has been running for SPONGE_CHARGING_MAX_MINUTES
-      (140 min) with tapping not yet underway, the state machine forces
-      the transition into tapping anyway, logged with a note. In practice
-      this is a backstop behind the 130-minute fast track above - it only
-      fires if no furnace_position_tilding sighting arrived between minute
-      130 and minute 140 to trigger the fast track itself.
-    - If tapping has been running for TAPPING_MAX_MINUTES (7 min) with no
-      furnace_position_normal detected yet, the state machine forces
-      tapping to end (and the heat to complete) anyway, logged with a note.
-  All three are pure time-based checks (see check_timeouts /
-  _check_timeouts_locked below), so they fire even with no detections at
-  all during that stretch.
-
-  Active-fire watchdog (independent of the above):
-  furnace_operation_activefire  -> heartbeat only; doesn't drive any stage
-                                    transition by itself, but each
-                                    confirmed sighting resets a clock for
-                                    whatever heat is currently in progress
-                                    (see note_activefire_seen).
-  If a heat is in progress (any of SCRAP_CHARGING / SPONGE_CHARGING /
-  TAPPING) and furnace_operation_activefire hasn't been confirmed for
-  ACTIVEFIRE_TIMEOUT_MINUTES - counting from the heat's own start if it's
-  never been seen at all yet - the heat is treated as invalid (camera lost
-  the fire / furnace isn't actually running) and every trace of it is
-  deleted: the SQL Heats + HeatEvents rows, the per-heat CSV file, and its
-  row in the index CSV. The app then drops straight back to IDLE, ready
-  for the next heat.
-  NOTE: this watches the *whole* heat, including scrap charging. If your
-  furnace can legitimately run some stage for longer than
-  ACTIVEFIRE_TIMEOUT_MINUTES with no furnace_operation_activefire sighting
-  on camera, that stage's heats will get wiped - tell me and this can be
-  scoped to only start once sponge charging begins.
-
-Assumptions made explicit (see README for more):
-  - Tilt/tap watching only kicks in while sponge charging is the active
-    stage, matching the described scrap -> sponge -> tapping flow.
-  - Once tapping is confirmed (either way), only furnace_position_normal
-    (to end it), the 15-minute timer, and magnet_feeding_scrap drive any
-    further transition.
-
-Database: every stage (scrap/sponge/tapping) and every heat is pushed to
-the SQL recorder the moment it *starts* (see _notify_event_start /
-record_heat_started), not just when it finishes. The row is written with
-its start time and empty end/duration, then updated in place once that
-stage or heat ends - so a process appears in the database as soon as it
-begins, not only once it's complete.
-
-This module only depends on the standard library so it can be exercised by
-tests/test_state_machine.py without OpenCV / ultralytics installed.
+  Auxiliary Events:
+  21 human_carring_silicomanganese / 22 human_feeding_silicomanganese
+    -> Logged as silicomanganese alloy additions in HeatEvents.
+  36 magnet_moving_slag
+    -> Logged as slag removal / deslagging in HeatEvents.
+  28 furnace_operation_undermaintenance
+    -> Logged in furnace status if maintenance occurs.
 """
 
 import csv
 import datetime
 import logging
 import os
+import random
 import threading
 
 import config
@@ -153,112 +70,140 @@ import config
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Classes used by the logic, matched by NAME (not numeric ID) - see the
-# module docstring above for why. Every name comes from config.PROCESS_CLASSES
-# - nothing here is hardcoded - so pointing any part of this logic at a
-# different class (new model, renamed class, or just a different desired
-# signal) is a one-line change in config.py, never in this file.
+# Class IDs used by the logic (mapped to 38-class YOLO model)
 # ---------------------------------------------------------------------------
-CLS_FURNACE_ACTIVEFIRE = config.PROCESS_CLASSES["furnace_activefire"]
-CLS_FURNACE_NORMAL = config.PROCESS_CLASSES["furnace_normal"]
-CLS_MAGNET_FEEDING_SCRAP = config.PROCESS_CLASSES["scrap_charging_start"]
-CLS_FURNACE_TILTING = config.PROCESS_CLASSES["furnace_tilting"]
-CLS_FURNACE_TILTING_ALT = config.PROCESS_CLASSES.get("furnace_tilting_alt")
-CLS_SPONGE_FEEDER_ON_FURNACE = config.PROCESS_CLASSES["sponge_charging_start"]
-CLS_SPONGE_FEEDER_ENGAGED = config.PROCESS_CLASSES["sponge_charging_start_alt"]
+CLS_NEGATIVE_PILLERS = 0
+CLS_SPONGE_FEEDER_FARFROMFURNACE = 1
+CLS_FURNACE_POSITION_UP = 2
+CLS_FURNACE_ACTIVEFIRE = 3
+CLS_NEGATIVE_SCRAPONGROUND = 4
+CLS_NEGATIVE_OTHERFURNACES = 5
+CLS_SPONGE_FEEDER_ENGAGED = 6
+CLS_NEGATIVE_CRANEBEAM = 7
+CLS_FURNACE_BOTTOM_VISIBLE_PARTIALLY = 8
+CLS_FURNACE_NORMAL = 9
+CLS_SPONGE_FEEDER_ON_FURNACE = 10
+CLS_NEGATIVE_FAN = 11
+CLS_NEGATIVE_FURNACESMOKE = 12
+CLS_LADDLE_MOVING_EMPTY = 13
+CLS_NEGATIVE_SUNLIGHT = 14
+CLS_MAGNET_MOVING_IDLE = 15
+CLS_MAGNET_MOVING_WITH_SCRAP = 16
+CLS_MAGNET_FEEDING_SCRAP = 17
+CLS_FURNACE_TILTING = 18
+CLS_FURNACE_OPERATION_SCRAPFEEDING = 19
+CLS_NEGATIVE_SLAG = 20
+CLS_HUMAN_CARRYING_SILICOMANGANESE = 21
+CLS_HUMAN_FEEDING_SILICOMANGANESE = 22
+CLS_NEGATIVE_NOTVISIBLE = 23
+CLS_FURNACE_BOTTOM_VISIBLE_COMPLETELY = 24
+CLS_LADDLE_MOVING_WITHMELTIRON = 25
+CLS_SPONGE_FEEDER_NOTENGAGED = 26
+CLS_MAGNET_MOVING_WITHSHAKER = 27
+CLS_FURNACE_OPERATION_UNDERMAINTENANCE = 28
+CLS_COIL_POSITION_PLACEDNEARFURNACE = 29
+CLS_NEGATIVE_RAMMINGMUSSCONTAINER = 30
+CLS_NEGATIVE_MAGNETONGROUND = 31
+CLS_FURMA_POSITION_PLACEDNEARFURNACE = 32
+CLS_FURNACE_OPERATION_FURMAREPLACED = 33
+CLS_NEGATIVE_HANGGINGCREATE = 34
+CLS_MAGNET_MOVING_WITH_SPONGE = 35
+CLS_MAGNET_MOVING_SLAG = 36
+CLS_MAGNET_FEEDING_SPONGE = 37
 
-# Derived signal (not a raw model class - see camera_worker.py /
-# detector.magnet_above_furnace_normal()) and the raw class name it's
-# derived from, so camera_worker.py can import both from one place.
-CLS_MAGNET_ABOVE_FURNACE = config.PROCESS_CLASSES["scrap_charging_magnet_alt"]
-CLS_MAGNET_MOVING_WITHSCRAP = "magnet_moving_withscrap"
+# Logical groupings
+SCRAP_CHARGING_CLASS_IDS = {
+    CLS_MAGNET_MOVING_WITH_SCRAP,        # 16
+    CLS_MAGNET_FEEDING_SCRAP,            # 17
+    CLS_FURNACE_OPERATION_SCRAPFEEDING,  # 19
+}
+
+SPONGE_CHARGING_CLASS_IDS = {
+    CLS_SPONGE_FEEDER_ENGAGED,           # 6
+    CLS_SPONGE_FEEDER_ON_FURNACE,        # 10
+    CLS_MAGNET_MOVING_WITH_SPONGE,       # 35
+    CLS_MAGNET_FEEDING_SPONGE,          # 37
+}
+
+# Any of these classes indicate furnace movement away from normal
+# position during SPONGE CHARGING. Temperature decides whether it is
+# tapping or a tilt.
+FURNACE_MOVEMENT_CLASS_IDS = {
+    CLS_FURNACE_POSITION_UP,                # 2
+    CLS_FURNACE_BOTTOM_VISIBLE_PARTIALLY,   # 8
+    CLS_FURNACE_TILTING,                    # 18
+    CLS_FURNACE_BOTTOM_VISIBLE_COMPLETELY,  # 24
+    CLS_LADDLE_MOVING_WITHMELTIRON,         # 25
+}
+
+FURNACE_NORMAL_CLASS_IDS = {
+    CLS_FURNACE_NORMAL,                     # 9
+}
+
+ACTIVEFIRE_CLASS_IDS = {
+    CLS_FURNACE_ACTIVEFIRE,                 # 3
+}
 
 # Classes the state machine actually reacts to. Passed to the debouncer so
 # it only tracks streaks for classes that matter.
-RELEVANT_CLASS_NAMES = {
-    CLS_FURNACE_NORMAL,
-    CLS_MAGNET_FEEDING_SCRAP,
-    CLS_MAGNET_ABOVE_FURNACE,
-    CLS_SPONGE_FEEDER_ON_FURNACE,
-    CLS_SPONGE_FEEDER_ENGAGED,
-    CLS_FURNACE_ACTIVEFIRE,
-    CLS_FURNACE_TILTING,
-}
-if CLS_FURNACE_TILTING_ALT:
-    RELEVANT_CLASS_NAMES.add(CLS_FURNACE_TILTING_ALT)
+RELEVANT_CLASS_IDS = (
+    SCRAP_CHARGING_CLASS_IDS
+    | SPONGE_CHARGING_CLASS_IDS
+    | FURNACE_MOVEMENT_CLASS_IDS
+    | FURNACE_NORMAL_CLASS_IDS
+    | ACTIVEFIRE_CLASS_IDS
+    | {
+        CLS_LADDLE_MOVING_EMPTY,                # 13
+        CLS_HUMAN_CARRYING_SILICOMANGANESE,     # 21
+        CLS_HUMAN_FEEDING_SILICOMANGANESE,      # 22
+        CLS_FURNACE_OPERATION_UNDERMAINTENANCE, # 28
+        CLS_MAGNET_MOVING_SLAG,                 # 36
+    }
+)
 
 # ---------------------------------------------------------------------------
-# Mid-process start-up
+# Mid-process start-up recovery
 # ---------------------------------------------------------------------------
-# If the app is (re)started while a heat is already underway, we'd otherwise
-# sit in IDLE forever waiting for the next magnet_feeding_scrap,
-# missing the rest of the heat entirely. Instead, if the very first thing we
-# see while IDLE is one of the classes below, assume a heat is already in
-# progress and start tracking it immediately from whichever stage that class
-# implies - scrap charging's own start time is simply unknown/unlogged in
-# that case.
-#
-# spange_feeder_onfurnace / spange_feeder_engaged, or the furnace visibly
-# moving -> already in sponge charging (or a tilt/tapping inside it); jump
-# straight there and let the normal SPONGE_CHARGING logic below sort out
-# whether this particular tilting sighting is just a tilt or is tapping.
-MID_PROCESS_SPONGE_CLASS_NAMES = {
-    CLS_SPONGE_FEEDER_ON_FURNACE,
-    CLS_SPONGE_FEEDER_ENGAGED,
-    CLS_FURNACE_TILTING,
-}
-if CLS_FURNACE_TILTING_ALT:
-    MID_PROCESS_SPONGE_CLASS_NAMES.add(CLS_FURNACE_TILTING_ALT)
-# No class definitively indicates tapping has already started on its own -
-# tapping is only ever entered via the two rules in the module docstring
-# above, both of which start from SPONGE_CHARGING.
-MID_PROCESS_TAPPING_CLASS_NAMES = set()
+MID_PROCESS_SPONGE_CLASS_IDS = (
+    SPONGE_CHARGING_CLASS_IDS
+    | FURNACE_MOVEMENT_CLASS_IDS
+)
 
 CSV_HEADERS = ["event", "start_time", "end_time", "duration_minutes", "tilt_number", "note"]
 INDEX_HEADERS = ["heat_id", "start_time", "end_time", "duration_minutes",
                   "tilt_count", "status", "csv_file"]
 
-# Roughly matches the plant's own reference numbers (used only for display
-# hints on the dashboard, never to force a transition).
+# Expected duration ranges (used for dashboard presentation and progress bars).
 EXPECTED_DURATION_MIN = {
-    "scrap_charging": (20, 30),
-    "sponge_charging": (60, 150),
-    "tapping": (2, 7),
+    "scrap_charging": (0, 45),
+    "sponge_charging": (90, 120),
+    "tapping": (10, 20),
 }
 
 # ---------------------------------------------------------------------------
-# Tunable timing rules - every value comes from config.py (see module
-# docstring for what each one is for; see config.py for the actual numbers).
+# Tunable timing rules
 # ---------------------------------------------------------------------------
-# Hard caps: a stage forced to end even with no qualifying detection yet.
-SCRAP_CHARGING_MAX_MINUTES = config.SCRAP_CHARGING_MAX_MINUTES
-SCRAP_CHARGING_MAX_THRESHOLD = datetime.timedelta(minutes=SCRAP_CHARGING_MAX_MINUTES)
+# Maximum scrap charging duration before automatic transition to sponge
+SCRAP_MAX_MINUTES = 45
+SCRAP_MAX_THRESHOLD = datetime.timedelta(minutes=SCRAP_MAX_MINUTES)
 
-SPONGE_CHARGING_MAX_MINUTES = config.SPONGE_CHARGING_MAX_MINUTES
-SPONGE_CHARGING_MAX_THRESHOLD = datetime.timedelta(minutes=SPONGE_CHARGING_MAX_MINUTES)
-
-SPONGE_FAST_TRACK_MINUTES = config.SPONGE_FAST_TRACK_MINUTES
-SPONGE_FAST_TRACK_THRESHOLD = datetime.timedelta(minutes=SPONGE_FAST_TRACK_MINUTES)
-
-# A tilt that's still open (furnace hasn't returned to "normal") after this
-# long is no longer treated as a quick inspection tilt - it's promoted
-# straight into tapping, whether or not furnace_position_normal ever confirms it.
-TILT_TO_TAPPING_MINUTES = config.TILT_TO_TAPPING_MINUTES
-TILT_TO_TAPPING_THRESHOLD = datetime.timedelta(minutes=TILT_TO_TAPPING_MINUTES)
-
-# Tapping cannot run longer than this, full stop: if furnace_position_normal
-# hasn't been detected by the time this many minutes have elapsed since
-# tapping started, the state machine forces tapping to end (and the heat to
-# complete) anyway.
-TAPPING_MAX_MINUTES = config.TAPPING_MAX_MINUTES
+# Maximum tapping duration before automatic heat completion if normal position is missed.
+TAPPING_MAX_MINUTES = 15
 TAPPING_MAX_THRESHOLD = datetime.timedelta(minutes=TAPPING_MAX_MINUTES)
 
-# If a heat is in progress and furnace_operation_activefire hasn't
-# been confirmed for this long, the heat is deleted (SQL + CSV) and the app
-# returns to IDLE. See the module docstring for the important caveat about
-# this covering the whole heat, including scrap charging.
+# Active-fire watchdog timeout.
 ACTIVEFIRE_TIMEOUT_MINUTES = config.ACTIVEFIRE_TIMEOUT_MINUTES
 ACTIVEFIRE_TIMEOUT = datetime.timedelta(minutes=ACTIVEFIRE_TIMEOUT_MINUTES)
+
+AWAY_FROM_NORMAL_CLASS_IDS = {
+    CLS_FURNACE_POSITION_UP,                # 2
+    CLS_FURNACE_BOTTOM_VISIBLE_PARTIALLY,   # 8
+    CLS_FURNACE_TILTING,                    # 18
+    CLS_FURNACE_BOTTOM_VISIBLE_COMPLETELY,  # 24
+}
+TILT_MIN_GAP = datetime.timedelta(seconds=45)
+TAPPING_CANDIDATE_WINDOW = datetime.timedelta(minutes=5)
+TAPPING_PRE_ROLL = datetime.timedelta(seconds=90)
 
 
 class HeatStateMachine:
@@ -267,30 +212,22 @@ class HeatStateMachine:
     STATE_SPONGE_CHARGING = "SPONGE_CHARGING"
     STATE_TAPPING = "TAPPING"
 
-    RELEVANT_CLASS_NAMES = RELEVANT_CLASS_NAMES
+    RELEVANT_CLASS_IDS = RELEVANT_CLASS_IDS
     EXPECTED_DURATION_MIN = EXPECTED_DURATION_MIN
 
     def __init__(self, data_dir="data/heats", index_csv="data/heats_index.csv",
-                 recorder=None, furnace_id=None, heat_id_prefix="Heat"):
+                 recorder=None, furnace_id=None, heat_id_prefix="Heat",
+                 temperature_monitor=None, on_activefire_loss=None,
+                 on_maintenance_detected=None):
         self.data_dir = data_dir
         self.index_csv = index_csv
-        # Optional db.SqlRecorder. It only ever puts a dict on a queue, so
-        # calling it from here costs microseconds and can't block the
-        # camera thread no matter what the database is doing. Leave it as
-        # None and the class behaves exactly as it did before: CSV only.
         self.recorder = recorder
-
-        # Tags every row this instance sends to the recorder (see _notify).
-        # Left as None by default so old callers/tests see the exact same
-        # behavior as before (db.py falls back to config.FURNACE_ID itself).
         self.furnace_id = furnace_id
-
-        # Prefix used when minting heat IDs (e.g. "Heat" -> "Heat_003_...").
-        # Two furnaces sharing one SQL Heats table must never produce the
-        # same HeatId (it's the primary key), so each furnace instance is
-        # given a distinct prefix. Must not contain "_" - heat_id is split
-        # on "_" elsewhere to recover the numeric heat number.
         self.heat_id_prefix = heat_id_prefix
+        self.temperature_monitor = temperature_monitor
+        self._on_activefire_loss = on_activefire_loss
+        self._on_maintenance_detected = on_maintenance_detected
+
         os.makedirs(self.data_dir, exist_ok=True)
         index_parent = os.path.dirname(self.index_csv)
         if index_parent:
@@ -305,14 +242,7 @@ class HeatStateMachine:
         self.heat_csv_path = None
         self.state = self.STATE_IDLE
 
-        # When the heat itself began, kept separately from scrap_start
-        # because scrap_start is cleared on a mid-process pickup.
         self.heat_start = None
-        # Row number of the next event inside the current heat's CSV. The
-        # database's event key is derived from (heat_id, ordinal, name),
-        # so a live row and the same row later re-read by the CSV backfill
-        # produce an identical key - which is what makes the backfill safe
-        # to run over data the app already inserted.
         self._event_ordinal = 0
 
         self.scrap_start = None
@@ -320,118 +250,111 @@ class HeatStateMachine:
         self.tapping_start = None
 
         self.tilt_count = 0
-        self.furnace_watch_active = False
-        self.furnace_watch_start = None
 
-        # Last time furnace_operation_activefire was confirmed,
-        # for whatever heat is currently in progress. Reset to the heat's
-        # own start time each time a new heat begins - see the module
-        # docstring for the active-fire watchdog this feeds.
-        self.last_activefire_at = None
+        self.furnace_moving = False
+        self.furnace_move_start = None
+        self.last_tilt_end = None
+
+        self.tap_candidate_active = False
+        self.tap_candidate_start = None      # moment class 24 was confirmed
+        self.tap_candidate_deadline = None
+        self._tap_monitors = []
+        self._tap_baselines = {}             # id(monitor) -> (value, seq)
+
+        self.pending_tilt = None             # (move_start, normal_time) held while a tapping check runs
+
+        self.last_activefire_at = datetime.datetime.now()
 
         self.completed_events = []
         self.last_event_desc = "Waiting for scrap charging to begin..."
         self.last_updated = None
 
+        self._startup_recovery_available = True
+
+        # Pending "capture this frame" requests for CameraWorker to drain on
+        # its next frame. Populated by _request_frame() at every stage
+        # boundary; drained atomically by get_pending_frame_requests().
+        self._frame_requests = []
+
     # -----------------------------------------------------------------
     # Public API
     # -----------------------------------------------------------------
     def process_detections(self, newly_confirmed_ids, timestamp=None):
-        """Feed a set of newly-confirmed class IDs (an "edge", not a raw
-        per-frame detection set) into the state machine."""
+        """Feed a set of newly-confirmed class IDs into the state machine."""
         timestamp = timestamp or datetime.datetime.now()
         newly_confirmed_ids = set(newly_confirmed_ids) if newly_confirmed_ids else set()
 
         with self._lock:
-            # An activefire sighting updates the watchdog clock before the
-            # timeout check below runs, so a call that both confirms furnace_operation_activefire
-            # *and* would otherwise be past the timeout doesn't get treated
-            # as stale - if we can see fire right now, the heat is fine.
-            if CLS_FURNACE_ACTIVEFIRE in newly_confirmed_ids:
+            # Active-fire sighting updates the watchdog clock
+            if newly_confirmed_ids & ACTIVEFIRE_CLASS_IDS:
                 self.last_activefire_at = timestamp
 
-            # Time-based transitions (the 15-minute tapping timer, the tilt
-            # duration -> tapping promotion, the active-fire watchdog) get a
-            # chance to fire first, using this call's timestamp as "now".
-            # That keeps ordering correct if, say, a magnet_feeding_scrap
-            # detection and a timer both would have fired by now.
+            # Time-based transitions (scrap 45m cap, tapping 15m cap, active-fire watchdog)
             self._check_timeouts_locked(timestamp)
 
             if not newly_confirmed_ids:
                 self.last_updated = timestamp
                 return
 
-            # Mid-process start-up: we're IDLE (fresh app start, or the
-            # previous heat's IDLE gap) and the very first thing we see is
-            # NOT the start-of-heat class, so a heat must already be
-            # underway. Pick it up immediately instead of waiting
-            # indefinitely for magnet_feeding_scrap. Checked before the
-            # normal transition logic below so that logic then runs
-            # against the *new* state in this same call.
-            scrap_charging_signal = CLS_MAGNET_FEEDING_SCRAP in newly_confirmed_ids \
-                or CLS_MAGNET_ABOVE_FURNACE in newly_confirmed_ids
+            # Mid-process start-up recovery
+            if (self.state == self.STATE_IDLE
+                    and self._startup_recovery_available
+                    and not (newly_confirmed_ids & SCRAP_CHARGING_CLASS_IDS)):
 
-            if self.state == self.STATE_IDLE and not scrap_charging_signal:
-                if newly_confirmed_ids & MID_PROCESS_TAPPING_CLASS_NAMES:
-                    self._start_new_heat(timestamp, mid_process_stage="tapping")
-                elif newly_confirmed_ids & MID_PROCESS_SPONGE_CLASS_NAMES:
-                    self._start_new_heat(timestamp, mid_process_stage="sponge_charging")
+                if newly_confirmed_ids & MID_PROCESS_SPONGE_CLASS_IDS:
+                    self._start_new_heat(
+                        timestamp,
+                        mid_process_stage="sponge_charging"
+                    )
 
-            if scrap_charging_signal:
+            # Scrap charging start (or close tapping if it was still open)
+            if newly_confirmed_ids & SCRAP_CHARGING_CLASS_IDS:
                 if self.state == self.STATE_IDLE:
                     self._start_new_heat(timestamp)
                 elif self.state == self.STATE_TAPPING:
-                    # The next heat's scrap charging has begun -> the
-                    # current heat's tapping (and the heat itself) ends
-                    # right now, and the new heat starts from this same
-                    # moment.
-                    self._finalize_tapping(timestamp, reason="scrap charging signal detected")
+                    self._finalize_tapping(timestamp, reason="scrap feeding detected")
                     self._start_new_heat(timestamp)
+                # (no case for STATE_SPONGE_CHARGING — scrap during sponge
+                # charging is now ignored, sponge keeps running)
 
-            sponge_charging_signal = CLS_SPONGE_FEEDER_ON_FURNACE in newly_confirmed_ids \
-                or CLS_SPONGE_FEEDER_ENGAGED in newly_confirmed_ids
-
-            if sponge_charging_signal and self.state == self.STATE_SCRAP_CHARGING:
+            # Transition from scrap charging to sponge charging
+            if (newly_confirmed_ids & SPONGE_CHARGING_CLASS_IDS) and self.state == self.STATE_SCRAP_CHARGING:
                 self._end_scrap_start_sponge(timestamp)
 
+            # Tapping completion (class 9 returns to normal)
             if self.state == self.STATE_TAPPING:
-                if CLS_FURNACE_NORMAL in newly_confirmed_ids:
+                if newly_confirmed_ids & FURNACE_NORMAL_CLASS_IDS:
                     self._finalize_tapping(timestamp, reason="furnace returned to normal")
 
             if self.state == self.STATE_SPONGE_CHARGING:
-                sponge_elapsed = timestamp - self.sponge_start if self.sponge_start else datetime.timedelta(0)
+                self._handle_sponge_movement(newly_confirmed_ids, timestamp)
 
-                is_tilting = CLS_FURNACE_TILTING in newly_confirmed_ids or (CLS_FURNACE_TILTING_ALT and CLS_FURNACE_TILTING_ALT in newly_confirmed_ids)
+            # Maintenance detection (class 28 overrides everything)
+            if CLS_FURNACE_OPERATION_UNDERMAINTENANCE in newly_confirmed_ids:
+                self.last_event_desc = f"{self.heat_id or 'Furnace'}: furnace under maintenance"
+                self._request_frame("furnace_undermaintenance", timestamp, "furnace operation undermaintenance (28)")
+                if self._on_maintenance_detected:
+                    self._on_maintenance_detected()
 
-                if is_tilting:
-                    if sponge_elapsed >= SPONGE_FAST_TRACK_THRESHOLD:
-                        self._enter_tapping(timestamp, timestamp, note=f">{SPONGE_FAST_TRACK_MINUTES} min sponge charging")
-                    elif not self.furnace_watch_active:
-                        self._begin_furnace_watch(timestamp)
-
-                if self.state == self.STATE_SPONGE_CHARGING and CLS_FURNACE_NORMAL in newly_confirmed_ids:
-                    if self.furnace_watch_active:
-                        self._resolve_furnace_watch(timestamp)
+            # Auxiliary process events during an active heat
+            if self.state != self.STATE_IDLE:
+                if newly_confirmed_ids & {CLS_HUMAN_FEEDING_SILICOMANGANESE, CLS_HUMAN_CARRYING_SILICOMANGANESE}:
+                    self._log_event("silicomanganese_addition", timestamp, timestamp, note="silicomanganese addition confirmed")
+                    self._request_frame("silicomanganese_addition", timestamp, "human feeding/carrying silicomanganese (21/22)")
+                if CLS_MAGNET_MOVING_SLAG in newly_confirmed_ids:
+                    self._log_event("slag_removal", timestamp, timestamp, note="magnet moving slag")
+                    self._request_frame("slag_removal", timestamp, "magnet moving slag (36)")
 
             self.last_updated = timestamp
 
     def check_timeouts(self, timestamp=None):
-        """Give purely time-based transitions a chance to fire even when no
-        new detection has come in. Safe (and meant) to call on every frame,
-        e.g. from the camera loop - process_detections() also runs the same
-        check on every call it makes, so nothing is missed either way."""
+        """Checks timeout rules and ongoing movement watch temperature."""
         timestamp = timestamp or datetime.datetime.now()
         with self._lock:
             self._check_timeouts_locked(timestamp)
 
     def note_activefire_seen(self, timestamp=None):
-        """Called whenever furnace_operation_activefire is
-        currently confirmed - every processed frame it's visible on, not
-        just the one frame it first became confirmed. A debounced class
-        only shows up in process_detections() once per confirm/lose edge,
-        which is fine for triggering a stage change but not enough to keep
-        a multi-minute watchdog clock alive while the fire stays visible
-        the whole time, so the camera worker calls this directly instead."""
+        """Updates active-fire watchdog clock when class 3 is observed."""
         timestamp = timestamp or datetime.datetime.now()
         with self._lock:
             self.last_activefire_at = timestamp
@@ -460,7 +383,24 @@ class HeatStateMachine:
                 "current_process_start": current_start.isoformat() if current_start else None,
                 "elapsed_seconds": elapsed,
                 "tilt_count": self.tilt_count,
-                "furnace_watch_active": self.furnace_watch_active,
+                "furnace_watch_active": self.furnace_moving or self.tap_candidate_active,
+                "furnace_moving": self.furnace_moving,
+                "furnace_move_start": self.furnace_move_start.isoformat() if self.furnace_move_start else None,
+                "tapping_candidate_active": self.tap_candidate_active,
+                "tapping_candidate_start": self.tap_candidate_start.isoformat() if self.tap_candidate_start else None,
+                "tapping_candidate_deadline": self.tap_candidate_deadline.isoformat() if self.tap_candidate_deadline else None,
+                "last_tilt_end": self.last_tilt_end.isoformat() if self.last_tilt_end else None,
+                "tapping_pre_roll_seconds": TAPPING_PRE_ROLL.total_seconds(),
+                "tapping_candidate_window_minutes": TAPPING_CANDIDATE_WINDOW.total_seconds() / 60.0,
+                "scrap_max_minutes": SCRAP_MAX_MINUTES,
+                "tapping_max_minutes": TAPPING_MAX_MINUTES,
+                "pyro_baselines": {
+                    getattr(m, "field", f"monitor_{i}"): (
+                        self._tap_baselines.get(id(m))[0]
+                        if self._tap_baselines.get(id(m)) else None
+                    )
+                    for i, m in enumerate(self._tap_monitors)
+                },
                 "last_activefire_at": self.last_activefire_at.isoformat() if self.last_activefire_at else None,
                 "activefire_timeout_minutes": ACTIVEFIRE_TIMEOUT_MINUTES,
                 "last_event": self.last_event_desc,
@@ -479,6 +419,10 @@ class HeatStateMachine:
         else:
             lines.append("Stage: Idle - waiting for scrap charging")
         lines.append(f"Tilt count: {s['tilt_count']}")
+        if s.get("tapping_candidate_active"):
+            lines.append("Furnace: bottom visible (tapping check running)")
+        elif s.get("furnace_moving"):
+            lines.append("Furnace: Moving")
         return lines
 
     def get_heats_history(self):
@@ -491,50 +435,64 @@ class HeatStateMachine:
         path = os.path.join(self.data_dir, f"{heat_id}.csv")
         return path if os.path.exists(path) else None
 
+    def get_pending_frame_requests(self):
+        """Atomically drain and return the frame-capture queue. Called by
+        CameraWorker every frame."""
+        with self._lock:
+            requests = list(self._frame_requests)
+            self._frame_requests.clear()
+            return requests
+
+    def _request_frame(self, event_name, timestamp, description="", extra_meta=None):
+        """Queue a frame capture tagged with the current stage. CameraWorker
+        fulfils it on its next loop (saves raw frame + annotated frame + JSON sidecar)."""
+        req = {
+            "heat_id": self.heat_id,
+            "furnace_id": self.furnace_id,
+            "event_name": event_name,
+            "timestamp": (timestamp or datetime.datetime.now()).isoformat(),
+            "description": description,
+            "stage": self.state,
+            "tilt_count": getattr(self, "tilt_count", 0),
+            "furnace_moving": getattr(self, "furnace_moving", False),
+            "tapping_candidate_active": getattr(self, "tap_candidate_active", False),
+            "last_event": getattr(self, "last_event_desc", ""),
+        }
+        if extra_meta and isinstance(extra_meta, dict):
+            req.update(extra_meta)
+        self._frame_requests.append(req)
+
     # -----------------------------------------------------------------
     # Internal transition handlers
     # -----------------------------------------------------------------
     def _check_timeouts_locked(self, timestamp):
         """Caller must already hold self._lock."""
-        # Hard cap: scrap charging cannot run longer than
-        # SCRAP_CHARGING_MAX_MINUTES. If no sponge_charging_start signal
-        # has arrived by then, force the transition anyway.
+        # Active-fire watchdog: a heat is running but class 3 hasn't been
+        # confirmed for ACTIVEFIRE_TIMEOUT_MINUTES -> purge the heat.
+        if self.state != self.STATE_IDLE and self.heat_id is not None:
+            baseline = self.last_activefire_at or self.heat_start
+            if baseline is not None and (timestamp - baseline) >= ACTIVEFIRE_TIMEOUT:
+                self._abort_heat_no_activefire(timestamp)
+
+        # 45-minute scrap charging maximum timeout: auto-transition to sponge
         if (self.state == self.STATE_SCRAP_CHARGING
                 and self.scrap_start is not None
-                and (timestamp - self.scrap_start) >= SCRAP_CHARGING_MAX_THRESHOLD):
+                and (timestamp - self.scrap_start) >= SCRAP_MAX_THRESHOLD):
+            sponge_start = self.scrap_start + SCRAP_MAX_THRESHOLD
+            logger.info(
+                "%s: scrap charging reached 45 min cap without sponge detection. "
+                "Auto-transitioning to sponge charging at %s.",
+                self.heat_id, sponge_start
+            )
             self._end_scrap_start_sponge(
-                timestamp,
-                note=f"scrap charging hit {SCRAP_CHARGING_MAX_MINUTES} min cap",
+                sponge_start,
+                note="auto-transition after 45 min scrap maximum"
             )
 
-        # Tilt held open too long: no furnace_position_normal has confirmed it was "just a
-        # tilt" within TILT_TO_TAPPING_MINUTES, so treat it as tapping
-        # having started back when the tilt itself started.
-        if (self.state == self.STATE_SPONGE_CHARGING
-                and self.furnace_watch_active
-                and self.furnace_watch_start is not None
-                and (timestamp - self.furnace_watch_start) >= TILT_TO_TAPPING_THRESHOLD):
-            self._enter_tapping(
-                self.furnace_watch_start, self.furnace_watch_start,
-                note=f"tilt held past {TILT_TO_TAPPING_MINUTES} min, treated as tapping",
-            )
+        if self.state == self.STATE_SPONGE_CHARGING and self.tap_candidate_active:
+            self._check_tapping_candidate(timestamp)
 
-        # Hard cap: sponge charging cannot run longer than
-        # SPONGE_CHARGING_MAX_MINUTES. In practice this is a backstop
-        # behind the 130-minute fast track - it only fires if no
-        # furnace_position_tilding sighting arrived between the fast-track
-        # minute and this cap to trigger tapping itself.
-        if (self.state == self.STATE_SPONGE_CHARGING
-                and self.sponge_start is not None
-                and (timestamp - self.sponge_start) >= SPONGE_CHARGING_MAX_THRESHOLD):
-            self._enter_tapping(
-                timestamp, timestamp,
-                note=f"sponge charging hit {SPONGE_CHARGING_MAX_MINUTES} min cap",
-            )
-
-        # Hard cap: tapping cannot run longer than TAPPING_MAX_MINUTES. If
-        # furnace_position_normal hasn't been detected by then, force
-        # tapping to end (and the heat to complete) anyway.
+        # 15-minute tapping timeout cap: safety completion if class 9 was missed
         if (self.state == self.STATE_TAPPING
                 and self.tapping_start is not None
                 and (timestamp - self.tapping_start) >= TAPPING_MAX_THRESHOLD):
@@ -543,22 +501,8 @@ class HeatStateMachine:
                 reason=f"tapping hit {TAPPING_MAX_MINUTES} min cap without furnace_position_normal",
             )
 
-        # Active-fire watchdog: a heat is running but furnace_operation_activefire hasn't been
-        # confirmed for ACTIVEFIRE_TIMEOUT_MINUTES (counting from the last
-        # confirmed sighting, or from the heat's own start if it's never
-        # been seen at all) -> the heat is invalid, wipe it.
-        # Temporarily restrict this logic to furnace 4/2 only.
-        if self.furnace_id == "4/2":
-            if self.state != self.STATE_IDLE and self.heat_id is not None:
-                baseline = self.last_activefire_at or self.heat_start
-                if baseline is not None and (timestamp - baseline) >= ACTIVEFIRE_TIMEOUT:
-                    self._abort_heat_no_activefire(timestamp)
-
     def _abort_heat_no_activefire(self, timestamp):
-        """Class 9 hasn't been seen for ACTIVEFIRE_TIMEOUT while this heat
-        was in progress. Delete every trace of it - the SQL Heats/HeatEvents
-        rows, the per-heat CSV, and its row in the index CSV - so a later
-        CSV->SQL backfill can't resurrect it, then drop back to IDLE."""
+        """Class 3 hasn't been seen for ACTIVEFIRE_TIMEOUT while this heat was in progress."""
         heat_id = self.heat_id
         heat_csv_path = self.heat_csv_path
         since = self.last_activefire_at or self.heat_start
@@ -572,13 +516,10 @@ class HeatStateMachine:
             heat_id, minutes_since, self.state,
         )
 
-        # SQL: fire-and-forget, same as every other recorder call - see
-        # _notify(). Deletes both the Heats row and every HeatEvents row.
         self._notify("record_heat_deleted", heat_id=heat_id)
+        self._request_frame("heat_aborted", timestamp,
+                            f"no active fire for {ACTIVEFIRE_TIMEOUT_MINUTES} min")
 
-        # CSV: remove the per-heat file and its row in the index so a
-        # future backfill (which just walks these files) has nothing left
-        # to re-insert for this heat.
         try:
             if heat_csv_path and os.path.exists(heat_csv_path):
                 os.remove(heat_csv_path)
@@ -586,10 +527,6 @@ class HeatStateMachine:
             logger.exception("Could not remove heat CSV %s", heat_csv_path)
         self._remove_index_row(heat_id)
 
-        # Back to a clean slate - the next detection starts a brand new
-        # heat. heat_number is deliberately left as-is (not decremented):
-        # the deleted heat still leaves a gap rather than having its number
-        # reused within the same run.
         self.heat_id = None
         self.heat_csv_path = None
         self.heat_start = None
@@ -598,22 +535,23 @@ class HeatStateMachine:
         self.sponge_start = None
         self.tapping_start = None
         self.tilt_count = 0
-        self.furnace_watch_active = False
-        self.furnace_watch_start = None
+        self._reset_furnace_watch()
         self.completed_events = []
-        self.last_activefire_at = None
+        self.last_activefire_at = datetime.datetime.now()
         self.state = self.STATE_IDLE
         self.last_event_desc = (
             f"{heat_id}: no active fire detected for {ACTIVEFIRE_TIMEOUT_MINUTES} min - "
             "heat data deleted"
         )
 
+        if self._on_activefire_loss is not None:
+            try:
+                self._on_activefire_loss()
+            except Exception:
+                logger.exception("activefire-loss callback failed")
+
     def _start_new_heat(self, timestamp, mid_process_stage=None):
-        """Starts a new heat. Normally this begins at scrap charging; if
-        mid_process_stage is given ("sponge_charging" or "tapping"), the app
-        was (re)started after that point already happened off-camera, so we
-        skip straight to that stage instead, logging the earlier stage(s) as
-        unknown-duration rather than guessing a start time for them."""
+        self._startup_recovery_available = False
         self.heat_number += 1
         self.heat_id = f"{self.heat_id_prefix}_{self.heat_number:03d}_{timestamp.strftime('%Y%m%d_%H%M%S')}"
         self.heat_csv_path = os.path.join(self.data_dir, f"{self.heat_id}.csv")
@@ -626,11 +564,9 @@ class HeatStateMachine:
         self.sponge_start = None
         self.tapping_start = None
         self.tilt_count = 0
-        self.furnace_watch_active = False
-        self.furnace_watch_start = None
+        self._reset_furnace_watch()
+
         self.completed_events = []
-        # Fresh watchdog clock for this heat - see the active-fire watchdog
-        # in the module docstring / _check_timeouts_locked.
         self.last_activefire_at = timestamp
         self.state = self.STATE_SCRAP_CHARGING
         self.last_event_desc = f"{self.heat_id}: scrap charging started"
@@ -643,29 +579,18 @@ class HeatStateMachine:
                      csv_file=os.path.basename(self.heat_csv_path))
 
         if mid_process_stage == "sponge_charging":
-            self._log_event("scrap_charging_unknown", None, None)
             self.scrap_start = None
             self.sponge_start = timestamp
             self.state = self.STATE_SPONGE_CHARGING
-            self.last_event_desc = (
-                f"{self.heat_id}: app started mid-process - already in "
-                "sponge charging (scrap charging start unknown)"
-            )
+            self.last_event_desc = f"{self.heat_id}: mid-process start during sponge charging"
+            self._log_event("scrap_charging_unknown", None, None, note="app started during sponge charging")
             self._notify_event_start("sponge_charging", timestamp)
-        elif mid_process_stage == "tapping":
-            self._log_event("scrap_charging_unknown", None, None)
-            self._log_event("sponge_charging_unknown", None, None)
-            self.scrap_start = None
-            self.sponge_start = None
-            self.tapping_start = timestamp
-            self.state = self.STATE_TAPPING
-            self.last_event_desc = (
-                f"{self.heat_id}: app started mid-process - already in "
-                "tapping (scrap/sponge charging start unknown)"
-            )
-            self._notify_event_start("tapping", timestamp)
+            self._request_frame("sponge_charging_start_midprocess", timestamp,
+                                "mid-process recovery - sponge charging")
         else:
             self._notify_event_start("scrap_charging", timestamp)
+            self._request_frame("scrap_charging_start", timestamp,
+                                "new heat started - scrap charging")
 
     def _end_scrap_start_sponge(self, timestamp, note=""):
         self._log_event("scrap_charging", self.scrap_start, timestamp, note=note)
@@ -674,56 +599,217 @@ class HeatStateMachine:
         suffix = f" ({note})" if note else ""
         self.last_event_desc = f"{self.heat_id}: sponge charging started{suffix}"
         self._notify_event_start("sponge_charging", timestamp)
+        self._request_frame("sponge_charging_start", timestamp,
+                            f"scrap -> sponge ({note or 'sponge class confirmed'})")
 
-    def _begin_furnace_watch(self, timestamp):
-        self.furnace_watch_active = True
-        self.furnace_watch_start = timestamp
-        self.last_event_desc = f"{self.heat_id}: furnace left normal position, watching..."
+    def _reset_furnace_watch(self):
+        self.furnace_moving = False
+        self.furnace_move_start = None
+        self.last_tilt_end = None
+        self.tap_candidate_active = False
+        self.tap_candidate_start = None
+        self.tap_candidate_deadline = None
+        self._tap_monitors = []
+        self._tap_baselines = {}
+        self.pending_tilt = None
 
-    def _enter_tapping(self, tapping_start_time, sponge_end_time, note=""):
-        """Closes out sponge charging and starts the tapping clock."""
-        self._log_event("sponge_charging", self.sponge_start, sponge_end_time, note=note)
+    def _configured_monitors(self):
+        """Only this slot's own monitor. A PYRO change on a *different*
+        furnace no longer confirms tapping - the manager guarantees this
+        monitor belongs to the physical stream currently backing this slot."""
+        return [self.temperature_monitor] if self.temperature_monitor is not None else []
+
+    def _handle_sponge_movement(self, ids, timestamp):
+        # 1. Open tapping check: ladle (25) has priority over PYRO.
+        if self.tap_candidate_active:
+            if CLS_LADDLE_MOVING_WITHMELTIRON in ids:
+                self._confirm_tapping(
+                    timestamp,
+                    "laddle_moving_withmeltiron (25) after furnace_bottom_visiblecompletely (24)")
+                return
+            if self._check_tapping_candidate(timestamp):
+                return
+
+        # 2. Furnace leaves normal -> start a movement cycle.
+        if (ids & AWAY_FROM_NORMAL_CLASS_IDS) and not self.furnace_moving:
+            self.furnace_moving = True
+            self.furnace_move_start = timestamp
+            self.last_event_desc = f"{self.heat_id}: furnace moved away from normal"
+
+        # 3. Class 24 (already debounced) opens the tapping check. Ignored if one is running.
+        if CLS_FURNACE_BOTTOM_VISIBLE_COMPLETELY in ids and not self.tap_candidate_active:
+            self._begin_tapping_candidate(timestamp)
+
+        # 4. Class 9 (already debounced) ends the movement cycle.
+        if (ids & FURNACE_NORMAL_CLASS_IDS) and self.furnace_moving:
+            self._on_return_to_normal(timestamp)
+
+    def _on_return_to_normal(self, timestamp):
+        move_start = self.furnace_move_start or timestamp
+        self.furnace_moving = False
+        self.furnace_move_start = None
+
+        if self.tap_candidate_active:
+            # Tapping check still running: decide when it resolves.
+            self.pending_tilt = (move_start, timestamp)
+            self.last_event_desc = f"{self.heat_id}: furnace back to normal, tapping check still running"
+            return
+        self._count_tilt(move_start, timestamp)
+
+    def _count_tilt(self, move_start, move_end):
+        if self.last_tilt_end is not None and (move_start - self.last_tilt_end) < TILT_MIN_GAP:
+            logger.info("%s: movement at %s within 45s of last tilt - ignored.", self.heat_id, move_start)
+            self.last_event_desc = f"{self.heat_id}: movement within 45s of last tilt ignored"
+            return
+        self.tilt_count += 1
+        self.last_tilt_end = move_end
+        self._log_event("tilt", move_start, move_end, tilt_number=self.tilt_count)
+        self.last_event_desc = f"{self.heat_id}: furnace back to normal - tilt #{self.tilt_count}"
+        self._request_frame(f"tilt_{self.tilt_count}", move_end,
+                            f"furnace movement resolved as tilt #{self.tilt_count}")
+
+    def _begin_tapping_candidate(self, timestamp):
+        self.tap_candidate_active = True
+        self.tap_candidate_start = timestamp
+        self.tap_candidate_deadline = timestamp + TAPPING_CANDIDATE_WINDOW
+        self._tap_monitors = self._configured_monitors()
+        self._tap_baselines = {}
+        for monitor in self._tap_monitors:            # record PYRO at the moment 24 was seen
+            sample = monitor.get_latest()
+            if sample and not sample.get("is_stale", True) and sample.get("value") is not None:
+                self._tap_baselines[id(monitor)] = (sample["value"], sample.get("seq"))
+        self.last_event_desc = f"{self.heat_id}: bottom fully visible - checking for tapping (5 min)"
+        self._request_frame("tapping_candidate_opened", timestamp,
+                            "furnace_bottom_visiblecompletely (24) - tapping candidate window opened")
+
+    def _check_tapping_candidate(self, timestamp):
+        """True if tapping was confirmed by this call."""
+        if not self.tap_candidate_active:
+            return False
+        if timestamp > self.tap_candidate_deadline:
+            self._expire_tapping_candidate(timestamp)
+            return False
+        for monitor in self._tap_monitors:
+            field_name = getattr(monitor, "field", "PYRO")
+            sample = monitor.get_latest()
+            if not sample or sample.get("is_stale", True) or sample.get("value") is None:
+                continue
+            base = self._tap_baselines.get(id(monitor))
+            if base is None:                            # nothing usable when 24 was seen
+                self._tap_baselines[id(monitor)] = (sample["value"], sample.get("seq"))
+                continue
+            if sample["value"] != base[0]:
+                self._confirm_tapping(
+                    timestamp,
+                    f"{field_name} changed {base[0]} -> {sample['value']} after "
+                    "furnace_bottom_visiblecompletely (24)")
+                return True
+        return False
+
+    def _expire_tapping_candidate(self, timestamp):
+        """5 minutes passed after class 24 with no class 25 and no PYRO
+        change -> the movement was only a TILT, not a tapping.
+
+        Per the plant rule, this is the ONLY outcome when class 24 is not
+        confirmed by class 25 or a PYRO change inside the 5-minute window.
+        Count the tilt now:
+          - If the furnace came back to normal (class 9) during the window,
+            use that recorded span (pending_tilt).
+          - Otherwise use class-24 start -> candidate deadline as the span,
+            so the tilt is still logged even if class 9 never arrived.
+        """
+        pending = self.pending_tilt
+        move_start = self.furnace_move_start
+        deadline = self.tap_candidate_deadline or timestamp
+
+        # Clear candidate state before counting so _count_tilt logs cleanly.
+        self.tap_candidate_active = False
+        self.tap_candidate_start = None
+        self.tap_candidate_deadline = None
+        self._tap_monitors = []
+        self._tap_baselines = {}
+        self.pending_tilt = None
+
+        # Also clear the "moving" flag: we've just resolved this movement.
+        # Without this, a class-9 arriving AFTER expiry would fire
+        # _on_return_to_normal and count a second tilt for the same movement.
+        self.furnace_moving = False
+        self.furnace_move_start = None
+
+        if pending is not None:
+            # Furnace returned to normal (class 9) during the window.
+            self._count_tilt(*pending)
+        elif move_start is not None:
+            # No clear return during the window: use class-24 start -> deadline.
+            self._count_tilt(move_start, deadline)
+
+    def _confirm_tapping(self, end_timestamp, note):
+        start = self.tap_candidate_start - TAPPING_PRE_ROLL      # 1.5 min before 24
+        if self.sponge_start is not None and start < self.sponge_start:
+            start = self.sponge_start                            # never earlier than sponge start
+        if start > end_timestamp:
+            start = end_timestamp
+        self._enter_tapping(tapping_start_time=start, sponge_end_time=start, note=note)
+        self._finalize_tapping(end_timestamp, reason=note)
+
+    def _enter_tapping(
+        self,
+        tapping_start_time,
+        sponge_end_time,
+        note=""
+    ):
+        self._log_event(
+            "sponge_charging",
+            self.sponge_start,
+            sponge_end_time,
+            note=note
+        )
+
         self.tapping_start = tapping_start_time
         self.state = self.STATE_TAPPING
 
-        self.furnace_watch_active = False
-        self.furnace_watch_start = None
+        self._reset_furnace_watch()
 
         suffix = f" ({note})" if note else ""
-        self.last_event_desc = f"{self.heat_id}: tapping started{suffix}"
-        self._notify_event_start("tapping", tapping_start_time)
 
-    def _resolve_furnace_watch(self, timestamp):
-        """furnace_position_normal seen while watching a furnace_position_tilding
-        sighting -> tilt completed."""
-        watch_start = self.furnace_watch_start
-        self.furnace_watch_active = False
-        self.furnace_watch_start = None
-
-        self.tilt_count += 1
-        self._log_event("tilt", watch_start, timestamp, tilt_number=self.tilt_count)
         self.last_event_desc = (
-            f"{self.heat_id}: furnace back to normal - tilt #{self.tilt_count} "
-            "(no tapping detected)"
+            f"{self.heat_id}: tapping started{suffix}"
         )
 
+        self._notify_event_start(
+            "tapping",
+            tapping_start_time
+        )
+        self._request_frame("tapping_start", tapping_start_time,
+                            f"tapping started ({note or 'PYRO/ladle confirmed'})")
+
     def _finalize_tapping(self, end_timestamp, reason=""):
-        """Ends tapping and completes the heat. Triggered either by a
-        furnace_position_normal detection, the TAPPING_MAX_MINUTES (7 min)
-        cap, or a magnet_feeding_scrap / magnet-above-furnace detection
-        (the next heat's scrap charging beginning)."""
+        """Ends tapping and completes the heat."""
+        self._request_frame("tapping_end", end_timestamp,
+                            f"heat complete ({reason or 'normal position'})")
         self._log_event("tapping", self.tapping_start, end_timestamp, note=reason)
         self._update_index_row(self.heat_id, status="COMPLETE", end=end_timestamp,
                                 tilt_count=self.tilt_count)
 
         heat_minutes = (round((end_timestamp - self.heat_start).total_seconds() / 60.0, 2)
                         if self.heat_start else None)
+
+        scrap_dur = sum(float(e["duration_minutes"]) for e in self.completed_events
+                        if e.get("event") == "scrap_charging" and e.get("duration_minutes"))
+        sponge_dur = sum(float(e["duration_minutes"]) for e in self.completed_events
+                         if e.get("event") == "sponge_charging" and e.get("duration_minutes"))
+        tapping_dur = sum(float(e["duration_minutes"]) for e in self.completed_events
+                          if e.get("event") == "tapping" and e.get("duration_minutes"))
+
         self._notify("record_heat_completed",
                      heat_id=self.heat_id,
                      heat_number=self.heat_number,
                      start_time=self.heat_start,
                      end_time=end_timestamp,
                      duration_minutes=heat_minutes,
+                     scrap_duration=round(scrap_dur, 2) if scrap_dur > 0 else None,
+                     sponge_duration=round(sponge_dur, 2) if sponge_dur > 0 else None,
+                     tapping_duration=round(tapping_dur, 2) if tapping_dur > 0 else None,
                      tilt_count=self.tilt_count,
                      status="COMPLETE",
                      csv_file=os.path.basename(self.heat_csv_path) if self.heat_csv_path else None)
@@ -737,7 +823,7 @@ class HeatStateMachine:
     # CSV helpers
     # -----------------------------------------------------------------
     def _log_event(self, name, start, end, tilt_number="", note=""):
-        duration_min = round((end - start).total_seconds() / 60.0, 2) if start else ""
+        duration_min = round((end - start).total_seconds() / 60.0, 2) if start and end else ""
         row = [
             name,
             start.isoformat() if start else "",
@@ -746,18 +832,14 @@ class HeatStateMachine:
             tilt_number,
             note,
         ]
-        with open(self.heat_csv_path, "a", newline="") as f:
-            csv.writer(f).writerow(row)
-        self.completed_events.append({
-            "event": name,
-            "start": start.isoformat() if start else None,
-            "end": end.isoformat() if end else None,
-            "duration_minutes": duration_min,
-            "tilt_number": tilt_number,
-            "note": note,
-        })
+        if self.heat_csv_path:
+            with open(self.heat_csv_path, "a", newline="") as f:
+                csv.writer(f).writerow(row)
 
-        # Same row, same ordinal, straight onto the recorder's queue.
+        event_dict = dict(zip(CSV_HEADERS, row))
+        event_dict["event_ordinal"] = self._event_ordinal
+        self.completed_events.append(event_dict)
+
         self._notify("record_event",
                      heat_id=self.heat_id,
                      heat_number=self.heat_number,
@@ -770,6 +852,92 @@ class HeatStateMachine:
                      ordinal=self._event_ordinal)
         self._event_ordinal += 1
 
+    def _ensure_index_header(self):
+        if not os.path.exists(self.index_csv) or os.path.getsize(self.index_csv) == 0:
+            with open(self.index_csv, "w", newline="") as f:
+                csv.writer(f).writerow(INDEX_HEADERS)
+
+    def _load_last_heat_number(self):
+        if not os.path.exists(self.index_csv):
+            return 0
+        with open(self.index_csv, "r", newline="") as f:
+            reader = csv.DictReader(f)
+            last_num = 0
+            for row in reader:
+                hid = row.get("heat_id", "")
+                parts = hid.split("_")
+                if len(parts) >= 2 and parts[1].isdigit():
+                    num = int(parts[1])
+                    if num > last_num:
+                        last_num = num
+            return last_num
+
+    def _append_index_row(self, status="IN_PROGRESS", start=None):
+        start_str = start.isoformat() if start else ""
+        row = [self.heat_id, start_str, "", "", self.tilt_count, status,
+               os.path.basename(self.heat_csv_path) if self.heat_csv_path else ""]
+        with open(self.index_csv, "a", newline="") as f:
+            csv.writer(f).writerow(row)
+
+    def _update_index_row(self, heat_id, status=None, end=None, tilt_count=None):
+        if not os.path.exists(self.index_csv):
+            return
+        rows = []
+        with open(self.index_csv, "r", newline="") as f:
+            reader = csv.DictReader(f)
+            headers = reader.fieldnames
+            for r in reader:
+                if r.get("heat_id") == heat_id:
+                    if status is not None:
+                        r["status"] = status
+                    if end is not None:
+                        r["end_time"] = end.isoformat()
+                        if r.get("start_time"):
+                            try:
+                                s_dt = datetime.datetime.fromisoformat(r["start_time"])
+                                dur = round((end - s_dt).total_seconds() / 60.0, 2)
+                                r["duration_minutes"] = str(dur)
+                            except ValueError:
+                                pass
+                    if tilt_count is not None:
+                        r["tilt_count"] = str(tilt_count)
+                rows.append(r)
+
+        with open(self.index_csv, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=headers)
+            writer.writeheader()
+            writer.writerows(rows)
+
+    def _remove_index_row(self, heat_id):
+        if not os.path.exists(self.index_csv):
+            return
+        rows = []
+        with open(self.index_csv, "r", newline="") as f:
+            reader = csv.DictReader(f)
+            headers = reader.fieldnames
+            for r in reader:
+                if r.get("heat_id") != heat_id:
+                    rows.append(r)
+        with open(self.index_csv, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=headers)
+            writer.writeheader()
+            writer.writerows(rows)
+
+    # -----------------------------------------------------------------
+    # SQL recorder notification
+    # -----------------------------------------------------------------
+    def _notify(self, method_name, **kwargs):
+        if not self.recorder:
+            return
+        if self.furnace_id is not None and "furnace_id" not in kwargs:
+            kwargs["furnace_id"] = self.furnace_id
+        try:
+            fn = getattr(self.recorder, method_name, None)
+            if fn:
+                fn(**kwargs)
+        except Exception:
+            logger.exception("Failed to notify SQL recorder: %s(%s)", method_name, kwargs)
+
     def _notify_event_start(self, name, start_time):
         self._notify("record_event",
                      heat_id=self.heat_id,
@@ -781,82 +949,3 @@ class HeatStateMachine:
                      tilt_number=None,
                      note=None,
                      ordinal=self._event_ordinal)
-
-    # -----------------------------------------------------------------
-    # Recorder plumbing
-    # -----------------------------------------------------------------
-    def _notify(self, method, **kwargs):
-        """Hand a row to the SQL recorder, if one is attached.
-
-        Deliberately swallows everything: the CSV is the system of record
-        and the furnace doesn't stop for a database, so nothing on this
-        path may raise into the camera thread. The recorder's own queue
-        makes the call non-blocking; this try/except covers the rest.
-        """
-        if self.recorder is None:
-            return
-        if self.furnace_id is not None:
-            kwargs.setdefault("furnace_id", self.furnace_id)
-        try:
-            getattr(self.recorder, method)(**kwargs)
-        except Exception:
-            logger.exception("SQL recorder call %s failed (continuing on CSV only)", method)
-
-    def _ensure_index_header(self):
-        if not os.path.exists(self.index_csv):
-            with open(self.index_csv, "w", newline="") as f:
-                csv.writer(f).writerow(INDEX_HEADERS)
-
-    def _load_last_heat_number(self):
-        highest = 0
-        for row in self.get_heats_history():
-            parts = (row.get("heat_id") or "").split("_")
-            if len(parts) >= 2 and parts[1].isdigit():
-                highest = max(highest, int(parts[1]))
-        return highest
-
-    def _append_index_row(self, status, start):
-        with open(self.index_csv, "a", newline="") as f:
-            csv.writer(f).writerow([
-                self.heat_id,
-                start.isoformat() if start else "",
-                "", "", 0, status,
-                os.path.basename(self.heat_csv_path),
-            ])
-
-    def _update_index_row(self, heat_id, status, end, tilt_count):
-        rows = []
-        with open(self.index_csv, "r", newline="") as f:
-            reader = csv.reader(f)
-            header = next(reader)
-            for row in reader:
-                rows.append(row)
-
-        for row in rows:
-            if row[0] == heat_id:
-                start = datetime.datetime.fromisoformat(row[1]) if row[1] else None
-                duration = round((end - start).total_seconds() / 60.0, 2) if start else ""
-                row[2] = end.isoformat()
-                row[3] = duration
-                row[4] = tilt_count
-                row[5] = status
-
-        with open(self.index_csv, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(header)
-            writer.writerows(rows)
-
-    def _remove_index_row(self, heat_id):
-        """Drop heat_id's row from the index CSV entirely (used when a heat
-        is deleted, as opposed to _update_index_row which just edits it)."""
-        if not os.path.exists(self.index_csv):
-            return
-        with open(self.index_csv, "r", newline="") as f:
-            reader = csv.reader(f)
-            header = next(reader)
-            rows = [row for row in reader if row and row[0] != heat_id]
-
-        with open(self.index_csv, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(header)
-            writer.writerows(rows)

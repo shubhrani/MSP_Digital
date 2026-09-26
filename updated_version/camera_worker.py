@@ -6,7 +6,9 @@ annotated JPEG frame available for the Flask MJPEG route.
 """
 
 import datetime
+import json
 import logging
+import os
 import threading
 import time
 
@@ -14,13 +16,8 @@ import cv2
 
 import config
 from debounce import ClassDebouncer
-from detector import FurnaceDetector, draw_detections, draw_status_overlay, magnet_above_furnace_normal
-from state_machine import (
-    CLS_FURNACE_ACTIVEFIRE,
-    CLS_FURNACE_NORMAL,
-    CLS_MAGNET_ABOVE_FURNACE,
-    CLS_MAGNET_MOVING_WITHSCRAP,
-)
+from detector import FurnaceDetector, draw_detections, draw_status_overlay
+from state_machine import CLS_FURNACE_ACTIVEFIRE
 
 logger = logging.getLogger(__name__)
 
@@ -30,17 +27,18 @@ _PLACEHOLDER_TEXT = "Waiting for camera..."
 
 
 class CameraWorker(threading.Thread):
-    def __init__(self, state_machine, rtsp_url=None):
+    def __init__(self, state_machine, rtsp_url=None, stream_id=None):
         super().__init__(daemon=True, name="CameraWorker")
         self.state_machine = state_machine
         self.rtsp_url = rtsp_url or config.RTSP_URL
+        self.stream_id = stream_id
 
         self.detector = None
         self.detector_error = None
 
         self.debouncer = ClassDebouncer(
             confirm_frames=config.DEBOUNCE_FRAMES,
-            class_ids=state_machine.RELEVANT_CLASS_NAMES,
+            class_ids=state_machine.RELEVANT_CLASS_IDS,
         )
 
         # A Condition (rather than a plain Lock + polling) lets frames()
@@ -66,7 +64,9 @@ class CameraWorker(threading.Thread):
         while self._running:
             if cap is None or not cap.isOpened():
                 logger.info("Connecting to RTSP stream: %s", self.rtsp_url)
-                cap = cv2.VideoCapture(self.rtsp_url)
+                cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
+                cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 10000)   # 10s to establish
+                cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000)    # 5s max wait per frame
                 if not cap.isOpened():
                     self._connected = False
                     self._set_placeholder_frame("Cannot connect to RTSP stream")
@@ -94,28 +94,14 @@ class CameraWorker(threading.Thread):
                 try:
                     detections = self.detector.detect(frame)
                     self._last_detections = detections
-                    # Matched by class NAME, not numeric ID - see
-                    # state_machine.RELEVANT_CLASS_NAMES / CLS_* constants.
-                    detected_names = {d["name"] for d in detections}
-
-                    # Derived signal: magnet_moving_withscrap positioned
-                    # just above furnace_position_normal in this same
-                    # frame - not a class the model predicts on its own, so
-                    # it's computed here from the raw boxes and fed into
-                    # the debouncer/state machine exactly like any other
-                    # confirmed class name (see
-                    # config.MAGNET_ABOVE_FURNACE_* and
-                    # detector.magnet_above_furnace_normal()).
-                    if magnet_above_furnace_normal(detections, CLS_MAGNET_MOVING_WITHSCRAP, CLS_FURNACE_NORMAL):
-                        detected_names.add(CLS_MAGNET_ABOVE_FURNACE)
-
-                    newly_confirmed, _ = self.debouncer.update(detected_names)
+                    detected_ids = {d["class_id"] for d in detections}
+                    newly_confirmed, _ = self.debouncer.update(detected_ids)
                     if newly_confirmed:
                         self.state_machine.process_detections(newly_confirmed, datetime.datetime.now())
                     # Heartbeat for the active-fire watchdog: a debounce
                     # edge only fires once per confirm/lose streak, which
                     # isn't enough to keep a multi-minute watchdog clock
-                    # alive while class 9 stays confirmed the whole time -
+                    # alive while class 3 stays confirmed the whole time -
                     # so this checks its *current* confirmed status, every
                     # processed frame, regardless of whether it's new.
                     if self.debouncer.is_confirmed(CLS_FURNACE_ACTIVEFIRE):
@@ -123,18 +109,19 @@ class CameraWorker(threading.Thread):
                 except Exception:
                     logger.exception("Detection failed on this frame, showing raw video for it")
 
-            # Purely time-based transitions (the scrap/sponge/tapping hard
-            # caps, the tilt -> tapping promotion, the active-fire
-            # watchdog) don't depend on any detection, so give them a
-            # chance to fire on every frame - this way a heat still closes
-            # out (or gets cleaned up) on time even during a stretch with
-            # no new class detections at all.
+            # Purely time/continuous transitions such as the 45-minute scrap cap,
+            # continuous PYRO movement check, 15-minute tapping cap, and
+            # active-fire watchdog are evaluated every frame.
             self.state_machine.check_timeouts(datetime.datetime.now())
+
+            # Save any debug frames the state machine queued on this or an
+            # earlier frame (transition evidence).
+            self._drain_frame_requests(frame)
 
             annotated = frame
             if self.detector is not None:
                 annotated = draw_detections(frame, self._last_detections,
-                                             self.state_machine.RELEVANT_CLASS_NAMES)
+                                             self.state_machine.RELEVANT_CLASS_IDS)
             annotated = draw_status_overlay(annotated, self.state_machine.get_status_lines())
 
             ok, jpeg = cv2.imencode(".jpg", annotated, [int(cv2.IMWRITE_JPEG_QUALITY), config.JPEG_QUALITY])
@@ -165,6 +152,156 @@ class CameraWorker(threading.Thread):
             self._latest_jpeg = jpeg_bytes
             self._frame_seq += 1
             self._frame_condition.notify_all()
+
+    def _drain_frame_requests(self, frame):
+        """Pull every pending frame-capture request from the state machine
+        and save the current (raw, pre-overlay) frame for each one."""
+        try:
+            requests = self.state_machine.get_pending_frame_requests()
+        except Exception:
+            logger.exception("Could not read pending frame requests")
+            return
+        for req in requests:
+            try:
+                self._save_debug_frame(frame, req)
+            except Exception:
+                logger.exception("Failed to save debug frame for %s",
+                                 req.get("event_name"))
+
+    def _save_debug_frame(self, frame, req):
+        heat_id = req.get("heat_id") or f"unassigned_{self.state_machine.furnace_id or 'furnace'}"
+        event_name = req.get("event_name") or "event"
+        ts_iso = req.get("timestamp") or datetime.datetime.now().isoformat()
+
+        safe_ts = (ts_iso.replace(":", "").replace("-", "")
+                          .replace(".", "").replace("+", "_")[:17])
+
+        heat_dir = os.path.join(config.FRAMES_DIR, heat_id)
+        os.makedirs(heat_dir, exist_ok=True)
+
+        # 1. Raw frame (without bounding boxes or status overlay)
+        raw_frame = frame.copy()
+        raw_filename = f"{event_name}_{safe_ts}_raw.jpg"
+        raw_filepath = os.path.join(heat_dir, raw_filename)
+
+        # 2. Annotated frame (with bounding boxes, labels, and status overlay)
+        annotated_frame = frame.copy()
+        if self.detector is not None and self._last_detections:
+            annotated_frame = draw_detections(
+                annotated_frame,
+                self._last_detections,
+                self.state_machine.RELEVANT_CLASS_IDS,
+            )
+        annotated_frame = draw_status_overlay(
+            annotated_frame,
+            self.state_machine.get_status_lines(),
+        )
+        annotated_filename = f"{event_name}_{safe_ts}_annotated.jpg"
+        annotated_filepath = os.path.join(heat_dir, annotated_filename)
+
+        # Legacy alias for backward compatibility
+        legacy_filename = f"{event_name}_{safe_ts}.jpg"
+        legacy_filepath = os.path.join(heat_dir, legacy_filename)
+
+        ok_raw = cv2.imwrite(raw_filepath, raw_frame,
+                             [int(cv2.IMWRITE_JPEG_QUALITY), config.JPEG_QUALITY])
+        ok_ann = cv2.imwrite(annotated_filepath, annotated_frame,
+                             [int(cv2.IMWRITE_JPEG_QUALITY), config.JPEG_QUALITY])
+        # Also write the legacy filename so any older endpoints or links still work
+        cv2.imwrite(legacy_filepath, annotated_frame,
+                    [int(cv2.IMWRITE_JPEG_QUALITY), config.JPEG_QUALITY])
+
+        if not ok_raw or not ok_ann:
+            logger.warning("cv2.imwrite failed when saving debug frames for %s in %s",
+                           event_name, heat_dir)
+
+        # 3. Gather comprehensive developer debug metadata
+        h, w = frame.shape[:2]
+        c = frame.shape[2] if len(frame.shape) > 2 else 1
+
+        formatted_detections = []
+        for d in (self._last_detections or []):
+            try:
+                box = [round(float(v), 1) for v in d.get("box", (0, 0, 0, 0))]
+                x1, y1, x2, y2 = box
+                cid = int(d.get("class_id", -1))
+                conf = float(d.get("confidence", 0.0))
+                formatted_detections.append({
+                    "class_id": cid,
+                    "name": str(d.get("name", "")),
+                    "confidence": round(conf, 4),
+                    "confidence_pct": f"{conf * 100:.1f}%",
+                    "box": box,
+                    "width": round(x2 - x1, 1),
+                    "height": round(y2 - y1, 1),
+                    "area": round((x2 - x1) * (y2 - y1), 1),
+                    "is_relevant": cid in self.state_machine.RELEVANT_CLASS_IDS,
+                })
+            except Exception:
+                continue
+
+        confirmed_classes = []
+        if hasattr(self.debouncer, "_confirmed"):
+            names_map = getattr(self.detector, "names", {}) if self.detector else {}
+            for cid in self.debouncer._confirmed:
+                confirmed_classes.append({
+                    "class_id": int(cid),
+                    "name": names_map.get(cid, str(cid)),
+                })
+
+        temp_data = None
+        if getattr(self.state_machine, "temperature_monitor", None):
+            try:
+                temp_data = self.state_machine.temperature_monitor.get_latest()
+            except Exception:
+                pass
+
+        meta = {
+            "heat_id": heat_id,
+            "furnace_id": getattr(self.state_machine, "furnace_id", None),
+            "event_name": event_name,
+            "timestamp": ts_iso,
+            "saved_at": datetime.datetime.now().isoformat(timespec="seconds"),
+            "stage": req.get("stage") or getattr(self.state_machine, "state", "UNKNOWN"),
+            "description": req.get("description", ""),
+            "filename": annotated_filename,
+            "filename_annotated": annotated_filename,
+            "filename_raw": raw_filename,
+            "frame_dimensions": {
+                "width": int(w),
+                "height": int(h),
+                "channels": int(c),
+            },
+            "detections_count": len(formatted_detections),
+            "detections": formatted_detections,
+            "confirmed_classes": confirmed_classes,
+            "tilt_count": getattr(self.state_machine, "tilt_count", 0),
+            "temperature": temp_data,
+            "stream": {
+                "stream_id": self.stream_id,
+                "rtsp_url": self.rtsp_url,
+            },
+            "state_machine": {
+                "state": getattr(self.state_machine, "state", ""),
+                "last_event": getattr(self.state_machine, "last_event_desc", ""),
+                "last_activefire_at": (
+                    self.state_machine.last_activefire_at.isoformat()
+                    if getattr(self.state_machine, "last_activefire_at", None) else None
+                ),
+            },
+        }
+
+        json_path = os.path.join(heat_dir, f"{event_name}_{safe_ts}.json")
+        try:
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(meta, f, indent=2)
+        except OSError:
+            logger.exception("Failed to write metadata JSON for %s", json_path)
+
+        logger.info(
+            "Saved debug frames for %s (heat %s): raw=%s, annotated=%s, detections=%d",
+            event_name, heat_id, raw_filename, annotated_filename, len(formatted_detections)
+        )
 
     def frames(self):
         """Generator that yields each newly-annotated JPEG frame as soon as

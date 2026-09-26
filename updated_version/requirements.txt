@@ -3,3 +3,5 @@ opencv-python-headless>=4.9
 ultralytics>=8.2
 numpy>=1.26
 pyodbc>=5.0
+influxdb-client>=1.36
+requests>=2.28

@@ -129,149 +129,89 @@ fixed `time.sleep()`. It's still capped at `MAX_STREAM_FPS` (20, in
 above that rate are skipped rather than queued, and duplicate frames (no
 new frame published since the last one sent) are never resent.
 
-## 3. What triggers what
+## 3. What triggers what (38-Class Model)
 
-The logic matches on class **names**, never numeric class IDs - a class's
-number can change every time the model is retrained (and it has: the class
-map below no longer matches the numbers from earlier versions of this app)
-without touching a single line of code, as long as the name stays the same.
+The process logic matches the **numeric class IDs** from the 38-class YOLO model. The production sequence is strictly maintained inside one heat:
 
-Every class that drives a transition is wired up in **one place**:
-`config.py`'s `PROCESS_CLASSES` dict. `state_machine.py` reads its `CLS_*`
-names from there and never hardcodes a class string itself, so if a
-retrain renames a class - or you simply want a different signal to drive a
-step - it's a one-line edit in `config.py`, nothing else needs to change:
+**Scrap charging (17 or 19) -> Sponge charging (10, 6, or 37) -> Tapping (18, 24, 2, or 25) -> Normal (9) -> COMPLETE**
 
-```python
-# config.py
-PROCESS_CLASSES = {
-    "scrap_charging_start":       "magnet_feeding_scrap",
-    "scrap_charging_magnet_alt":  "magnet_moving_withscrap_above_furnace_normal",
-    "sponge_charging_start":      "spange_feeder_onfurnace",
-    "sponge_charging_start_alt":  "spange_feeder_engaged",
-    "furnace_normal":             "furnace_position_normal",
-    "furnace_tilting":            "furnace_position_tilding",
-    "furnace_activefire":         "furnace_operation_activefire",
-}
-```
+| ID | Class | Effect |
+|----|-------|--------|
+| 17 | `magnet_feeding_scrap` | Starts a new heat and starts scrap charging. Primary scrap charging trigger. |
+| 19 | `furnace_operation_scrapfeeding` | Starts a new heat and starts scrap charging. Co-trigger with #17. |
+| 10 | `sponge_feeder_onfurnace` | Ends scrap charging and starts sponge charging in the **same heat**. |
+| 6 | `sponge_feeder_engaged` | Ends scrap charging and starts sponge charging in the **same heat**. |
+| 37 | `magnet_feeding_sponge` | Sponge feeding via magnet/bucket; transitions scrap to sponge. |
+| 8 | `furnace_bottom_visiblepartially` | Inspection tilt / partial deslagging tilt during sponge charging; increments `tilt_count` when furnace returns to normal within 1.9 min. |
+| 18 | `furnace_position_tilting` | While sponge charging is active, immediately closes sponge charging and starts tapping in the **same heat**. |
+| 24 | `furnace_bottom_visiblecompletely` | While sponge charging is active, immediately closes sponge charging and starts tapping in the **same heat**. |
+| 2 | `furnace_position_up` | Furnace tilted upward for pour; starts tapping. |
+| 25 | `laddle_moving_withmeltiron` | Molten steel filled ladle; confirms tapping stage. |
+| 9 | `furnace_position_normal` | While tapping is active, ends tapping and completes the heat. |
+| 3 | `furnace_operation_activefire` | Heartbeat used by the active-fire watchdog; resets the 10-minute timeout clock. |
+| 21 / 22 | `human_carring_silicomanganese` / `human_feeding_silicomanganese` | Logged as alloy addition events (`silicomanganese_addition`) in `HeatEvents`. |
+| 36 | `magnet_moving_slag` | Logged as slag removal events (`slag_removal`) in `HeatEvents`. |
+| 28 | `furnace_operation_undermaintenance` | Noted in status if maintenance is confirmed during furnace turnaround. |
 
-All the timing thresholds below are likewise plain numbers at the bottom
-of `config.py` (`SCRAP_CHARGING_MAX_MINUTES`, `SPONGE_CHARGING_MAX_MINUTES`,
-`SPONGE_FAST_TRACK_MINUTES`, `TILT_TO_TAPPING_MINUTES`,
-`TAPPING_MAX_MINUTES`, `ACTIVEFIRE_TIMEOUT_MINUTES`) - change the value
-there, restart the app, done.
+### Startup mid-process recovery
 
-| Role (`PROCESS_CLASSES` key) | Default class name | Effect |
-|---|---|---|
-| `scrap_charging_start` | `magnet_feeding_scrap` | Starts a **new heat**; starts the *scrap charging* clock. If this fires while the *previous* heat is still in `TAPPING`, that heat is closed out immediately and the new heat starts from this same moment. |
-| `scrap_charging_magnet_alt` | *(derived, not a model class)* | Same effect as `scrap_charging_start` above. Computed every frame from the raw `magnet_moving_withscrap` and `furnace_position_normal` boxes - true when the magnet box sits just above the furnace box (see "Scrap charging: the magnet-above-furnace signal" below). |
-| `sponge_charging_start` | `spange_feeder_onfurnace` | Ends *scrap charging*, starts the *sponge charging* clock. |
-| `sponge_charging_start_alt` | `spange_feeder_engaged` | Same effect as `sponge_charging_start` above - either class ends scrap charging. |
-| `furnace_tilting` | `furnace_position_tilding` | The **only** signal tapping reacts to - see "Tapping: the only two ways in" below. |
-| `furnace_normal` | `furnace_position_normal` | While `TAPPING`: ends tapping, heat complete. While *watching* a tilt: resolves it back to "just a tilt" (see below). |
-| `furnace_activefire` | `furnace_operation_activefire` | Heartbeat only. Resets the active-fire watchdog clock; doesn't drive a transition on its own. |
-
-All other classes (ladle, negative samples, etc.) are detected and drawn
-on the video for your own reference, but don't drive any of the timers.
-
-### Scrap charging: the magnet-above-furnace signal
-
-`magnet_moving_withscrap` on its own doesn't mean anything to the state
-machine. Every processed frame, `camera_worker.py` checks whether a
-`magnet_moving_withscrap` box sits **just above** a `furnace_position_normal`
-box in that same frame (vertical gap under `MAGNET_ABOVE_FURNACE_MAX_GAP_PX`,
-80px by default, and horizontal overlap over `MAGNET_ABOVE_FURNACE_MIN_OVERLAP_RATIO`,
-15% by default) and, if so, feeds the derived class name into the state
-machine exactly like any other confirmed detection. Tune those two
-`config.py` values once you can see it against real footage.
-
-### Tapping: the only two ways in
-
-Tapping starts **only** when one of these two things happens - nothing
-else starts it:
-
-1. `furnace_tilting` is held open for more than `TILT_TO_TAPPING_MINUTES`
-   (**3.5 min** by default) without `furnace_normal` ever arriving to
-   resolve it &mdash; promoted straight into tapping, backdated to when
-   the tilt itself began. A pure time check, so it fires from
-   `check_timeouts()` even with no further detection at all.
-2. `furnace_tilting` is detected once sponge charging has already run for
-   `SPONGE_FAST_TRACK_MINUTES` (**130 min** by default) or more &mdash;
-   taken as tapping starting immediately, no need to also wait out
-   `TILT_TO_TAPPING_MINUTES` first (the "fast track").
-
-Anywhere under the 130-minute mark, a `furnace_tilting` sighting followed
-by `furnace_normal` inside `TILT_TO_TAPPING_MINUTES` is just a tilt:
-`tilt_count += 1`, and the app keeps waiting inside sponge charging.
+If the application is first launched/restarted while the furnace is already in
+sponge or tapping, it may recover that **one currently-running heat** from the
+first class 10 / 6 / 18 / 24 / 2 / 25 seen. This recovery permission is consumed as soon as
+that heat is created. After the heat finishes, lingering sponge/tilting/bottom-
+visible detections cannot create another heat. The next heat must wait for a
+new scrap detection (class 17 or 19). This prevents phantom heats from
+lingering equipment.
 
 ### Ending a heat
 
-Tapping (and the heat) ends whichever of these happens first:
+Once tapping has started, class 9 (`furnace_position_normal`) completes the
+heat. If the next scrap detection (class 17 or 19) arrives while tapping is still active,
+the current heat is completed at that moment and the next heat begins immediately.
+Additionally, if normal position is missed on camera, a 15-minute safety timeout
+cap (`TAPPING_MAX_MINUTES`) automatically finalizes tapping and completes the heat.
 
-- `furnace_normal` is detected while `TAPPING`, or
-- `TAPPING_MAX_MINUTES` (**7 min** by default) have passed since tapping
-  started with no `furnace_normal` detected &mdash; a hard cap, logged
-  with a note, purely time-based so it fires even with no detections at
-  all during that stretch, or
-- `scrap_charging_start` (`magnet_feeding_scrap`, or the magnet-above-
-  furnace signal) is detected &mdash; which also means the *next* heat's
-  scrap charging has begun, so a new heat starts immediately from that
-  same moment.
+### Active-fire watchdog (class 3, `furnace_operation_activefire`)
 
-### Scrap/sponge charging hard caps
-
-Independent of everything above:
-
-- Scrap charging cannot run longer than `SCRAP_CHARGING_MAX_MINUTES`
-  (**40 min** by default). If no `sponge_charging_start` signal has
-  arrived by then, the state machine forces the transition into sponge
-  charging anyway.
-- Sponge charging cannot run longer than `SPONGE_CHARGING_MAX_MINUTES`
-  (**140 min** by default). If tapping hasn't started by then, the state
-  machine forces the transition into tapping anyway. In practice this is
-  just a backstop behind the 130-minute fast track above - it only fires
-  if no `furnace_tilting` sighting ever arrived to trigger the fast track
-  itself.
-
-Both are pure time-based checks (`check_timeouts()`), so they fire even
-with no detections at all during that stretch.
-
-### Active-fire watchdog (`furnace_activefire`)
-
-If a heat is in progress (any stage) and `furnace_activefire` hasn't been
-confirmed for `ACTIVEFIRE_TIMEOUT_MINUTES` (50 min by default) &mdash;
-counting from the heat's own start if it's never been seen at all &mdash;
-the app assumes the camera lost the fire (or the furnace isn't actually
-running) and deletes that heat entirely: the SQL `Heats`/`HeatEvents`
-rows, the per-heat CSV file, and its row in `heats_index.csv`. The app
-then drops back to `IDLE`, ready for the next heat, and the next detection
-starts a brand new one (heat numbers aren't reused, so the deleted heat
-leaves a gap rather than a duplicate).
+If a heat is in progress (any stage) and class 3 hasn't been confirmed
+for **10 minutes** (`ACTIVEFIRE_TIMEOUT_MINUTES`) &mdash; counting from
+the heat's own start if it's never been seen at all &mdash; the app
+assumes the camera lost the fire (or the furnace isn't actually running)
+and deletes that heat entirely: the SQL `Heats`/`HeatEvents` rows, the
+per-heat CSV file, and its row in `heats_index.csv`. The app then drops
+back to `IDLE`, ready for the next heat.
 
 **Note:** this currently watches the whole heat, including scrap
 charging. If scrap charging (or some other stage) can legitimately run
-longer than `ACTIVEFIRE_TIMEOUT_MINUTES` with no active-fire sighting on
-camera, that stage's heats will get wiped &mdash; tell me and this can be
-scoped to only start once sponge charging begins.
+for more than 10 minutes with no class-9 sighting on camera, every heat
+will get wiped during that stage &mdash; tell me and this can be scoped to
+start only once sponge charging begins instead.
 
 ### Assumptions I made where the spec was open-ended
 
-- **Tilt/tapping watching only starts during sponge charging**, and the
+- **Tilt/tap watching only starts during sponge charging**, and the
   130-minute fast track is likewise only evaluated while the state is
-  `SPONGE_CHARGING`. If your furnace can also swing through
-  `furnace_tilting` meaningfully during scrap charging, tell me and I'll
-  widen this.
-- **All the time-based transitions are checked continuously**, not just
-  when a new class is detected: the camera worker checks them on every
-  frame, and the status API checks them on every request, so a tilt gets
-  promoted to tapping (or a hard cap fires, or a heat gets deleted by the
-  active-fire watchdog) on time even during a stretch with no relevant
-  detections at all.
+  `SPONGE_CHARGING`. If your furnace can also swing through these classes
+  meaningfully during scrap charging, tell me and I'll widen this.
+- **"2:13" is read as 2 minutes 13 seconds** (mm:ss), matching how the
+  rest of the app displays durations. If you meant 2.13 minutes (2 min 8
+  sec) instead, it's a one-line change to `TAPPING_BACKDATE` in
+  `state_machine.py`.
+- **The 15-minute tapping timer is checked continuously**, not just when a
+  new class is detected: the camera worker checks it on every frame, and
+  the status API checks it on every request, so a heat closes out on time
+  even during a stretch with no relevant detections at all.
+- If `magnet_feeding_scrap` arrives *after* the 15-minute mark has already
+  passed, the timer is treated as having closed the previous heat first
+  (capped at exactly +15 min), and the magnet detection starts a fresh
+  heat from its own (later) timestamp rather than backdating anything.
 - **Debouncing:** a class has to be seen on `DEBOUNCE_FRAMES` (default 5)
   consecutive *processed* frames before it's treated as "confirmed" and
   handed to the logic above. This is there to stop a single flickery frame
   from starting/ending a stage. Tune it in `config.py` if it feels too
-  slow or too twitchy for your camera/model.
+  slow or too twitchy for your camera/model. The tilt cooldown is a
+  second, independent layer on top of this, aimed specifically at rapid
+  tilt/normal cycling rather than single-frame flicker.
 
 If any of these read differently from what you had in mind, the state
 machine is isolated in `state_machine.py` and covered by
@@ -282,12 +222,17 @@ machine is isolated in `state_machine.py` and covered by
 Each heat gets its own file: `data/heats/Heat_003_20260811_143000.csv`
 
 ```
-event,start_time,end_time,duration_minutes,tilt_number,note
-scrap_charging,2026-08-11T14:30:00,2026-08-11T14:52:00,22.0,,
-tilt,2026-08-11T15:10:00,2026-08-11T15:11:30,1.5,1,
-sponge_charging,2026-08-11T14:52:00,2026-08-11T16:10:00,78.0,,
-tapping,2026-08-11T16:10:00,2026-08-11T16:15:30,5.5,,
+event,start_time,end_time,duration_minutes,tilt_number
+scrap_charging,2026-08-11T14:30:00,2026-08-11T14:52:00,22.0,
+tilt,2026-08-11T15:10:00,2026-08-11T15:11:30,1.5,1
+tilt_ignored_cooldown,2026-08-11T15:12:10,2026-08-11T15:12:40,0.5,
+sponge_charging,2026-08-11T14:52:00,2026-08-11T16:10:00,78.0,
+tapping,2026-08-11T16:10:00,2026-08-11T16:25:00,15.0,
 ```
+
+`tilt_ignored_cooldown` rows are cycles that resolved within 2 minutes of
+the previous *counted* tilt, so they show up in the CSV for audit purposes
+but don't have a `tilt_number` and aren't reflected in `tilt_count`.
 
 `data/heats_index.csv` keeps one summary row per heat (id, start, end,
 total duration, tilt count, status, and the CSV filename) &mdash; that's what
@@ -305,29 +250,6 @@ link.
 - `JPEG_QUALITY` &mdash; quality of the frames streamed to the browser.
 - `MAX_STREAM_FPS` (top of `camera_worker.py`) &mdash; caps how fast
   `/video_feed` sends frames to the browser, independent of source fps.
-
-## 5b. Process logic tuning (`config.py`) - new model / different classes
-
-Everything the state machine reacts to is configurable, without touching
-any code:
-
-- **`CLASS_NAMES`** &mdash; the model's numeric-ID-to-name map. Only used as
-  a fallback for a model that doesn't embed its own names (`detector.py`
-  prefers the names baked into the `.pt` weights when present). Update this
-  whenever you swap in a retrained model with a different class list/order.
-- **`PROCESS_CLASSES`** &mdash; which class NAME drives each step (scrap
-  charging start + its magnet-above-furnace alt, sponge charging start +
-  its alt, furnace normal/tilting, active fire). This is the dict to edit
-  if a retrain renames a class, or you simply want a different signal to
-  drive a step - see section 3 above.
-- **Timings** &mdash; `SCRAP_CHARGING_MAX_MINUTES`, `SPONGE_CHARGING_MAX_MINUTES`,
-  `SPONGE_FAST_TRACK_MINUTES`, `TILT_TO_TAPPING_MINUTES`,
-  `TAPPING_MAX_MINUTES`, `ACTIVEFIRE_TIMEOUT_MINUTES` &mdash; also plain
-  numbers in `config.py`, right below `PROCESS_CLASSES`.
-- **Magnet-above-furnace spatial thresholds** &mdash;
-  `MAGNET_ABOVE_FURNACE_MAX_GAP_PX`, `MAGNET_ABOVE_FURNACE_MIN_OVERLAP_RATIO`.
-
-Restart the app after editing any of these for the change to take effect.
 
 ## 6. Known limitations
 

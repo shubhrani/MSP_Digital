@@ -29,7 +29,7 @@ def main():
     parser = argparse.ArgumentParser(description="Backfill heat CSVs into SQL Server.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Parse and report, but don't write to the database.")
-    parser.add_argument("--furnace-id", choices=sorted({f["furnace_id"] for f in config.FURNACES.values()}),
+    parser.add_argument("--furnace-id", choices=sorted({f["furnace_id"] for f in config.FURNACE_SLOTS.values()}),
                         default=config.FURNACE_ID,
                         help="Which furnace these CSVs belong to (default: %(default)s). "
                              "Picks that furnace's own data-dir/index-csv unless overridden below.")
@@ -39,7 +39,7 @@ def main():
 
     # Resolve data-dir/index-csv from the chosen furnace unless the caller
     # gave explicit paths.
-    furnace_cfg = next((f for f in config.FURNACES.values() if f["furnace_id"] == args.furnace_id),
+    furnace_cfg = next((f for f in config.FURNACE_SLOTS.values() if f["furnace_id"] == args.furnace_id),
                        None)
     data_dir = args.data_dir or (furnace_cfg["data_dir"] if furnace_cfg else config.DATA_DIR)
     index_csv = args.index_csv or (furnace_cfg["index_csv"] if furnace_cfg else config.INDEX_CSV)

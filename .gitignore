@@ -4,4 +4,26 @@ __pycache__/
 *.pyc
 Updated_version/venv/
 updated_version/venv/
+.env
+*.env
 
+# Ephemeral root test output
+/data/
+
+# Temporary test data
+_tmp_data/
+**/_tmp_data/
+
+# Captured event video frames
+**/data/frames/
+
+# Local backup copies and archives
+* - Copy/
+* - Copy*/
+*- Copy/
+*- Copy*/
+*.zip
+
+# Files exceeding GitHub 100MB limit
+yolo12x.pt
+**/best(try).pt

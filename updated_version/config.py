@@ -6,6 +6,16 @@ codebase needs to change for a normal deployment.
 
 import os
 
+_env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+if os.path.isfile(_env_path):
+    with open(_env_path, "r", encoding="utf-8") as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if not _line or _line.startswith("#") or "=" not in _line:
+                continue
+            _k, _v = _line.split("=", 1)
+            os.environ.setdefault(_k.strip(), _v.strip().strip('"').strip("'"))
+
 # ---------------------------------------------------------------------------
 # Camera / stream
 # ---------------------------------------------------------------------------
@@ -20,8 +30,10 @@ RECONNECT_DELAY_SECONDS = 5
 
 # ---------------------------------------------------------------------------
 # Model
-# ---------------------------------------------------------------------------
-MODEL_PATH = "models/self_trained_200.pt"
+MODEL_PATH = os.getenv(
+    "MODEL_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "furnace_monitor_best.pt"),
+)
 
 # Minimum confidence for a detection to be considered at all.
 CONFIDENCE_THRESHOLD = 0.5
@@ -73,34 +85,134 @@ JPEG_QUALITY = 80
 # camera's IP or credentials change:
 #     export FURNACE_4_1_RTSP="rtsp://user:pass@10.50.40.151:554/..."
 #     export FURNACE_4_2_RTSP="rtsp://user:pass@10.50.40.152:554/..."
-FURNACES = {
+# ---------------------------------------------------------------------------
+# Physical camera streams (3 of them) — camera only, no PYRO here.
+# ---------------------------------------------------------------------------
+STREAMS = [
+    {
+        "stream_id": "stream-1",
+        "name": "Camera 10.50.40.153",
+        "rtsp_url": os.getenv(
+            "STREAM_1_RTSP",
+            "rtsp://admin:Admin@1234@10.50.40.153:554/video/live?channel=1&subtype=0",
+        ),
+    },
+    {
+        "stream_id": "stream-2",
+        "name": "Camera 10.50.40.152",
+        "rtsp_url": os.getenv(
+            "STREAM_2_RTSP",
+            "rtsp://admin:Admin@1234@10.50.40.152:554/video/live?channel=1&subtype=0",
+        ),
+    },
+    {
+        "stream_id": "stream-3",
+        "name": "Camera 10.50.40.151",
+        "rtsp_url": os.getenv(
+            "STREAM_3_RTSP",
+            "rtsp://admin:Admin@1234@10.50.40.151:554/video/live?channel=1&subtype=0",
+        ),
+    },
+]
+
+# ---------------------------------------------------------------------------
+# Logical furnace slots — these carry PYRO, because PYRO is a property
+# of the furnace identity, not of whatever camera happens to be backing it.
+#
+# PYRO4/1 follows whichever camera is currently acting as 4/1.
+# PYRO4/2 follows whichever camera is currently acting as 4/2.
+# Both tags are fixed for the lifetime of the process; only the camera
+# behind each slot changes during a swap.
+# ---------------------------------------------------------------------------
+FURNACE_SLOTS = {
     "4-1": {
         "furnace_id": "4/1",
         "name": "Furnace 4/1",
-        "rtsp_url": os.getenv(
-            "FURNACE_4_1_RTSP",
-            "rtsp://admin:Admin@1234@10.50.40.151:554/video/live?channel=1&subtype=0",
-        ),
         "data_dir": os.getenv("FURNACE_4_1_DATA_DIR", "data/heats_4_1"),
         "index_csv": os.getenv("FURNACE_4_1_INDEX_CSV", "data/heats_index_4_1.csv"),
         "heat_id_prefix": "Heat41",
+        "influx_group": os.getenv("FURNACE_4_1_INFLUX_GROUP", "SFC4/1"),
+        "pyro_field":   os.getenv("FURNACE_4_1_PYRO_FIELD",   "PYRO4/1"),
     },
     "4-2": {
         "furnace_id": "4/2",
         "name": "Furnace 4/2",
-        "rtsp_url": os.getenv("FURNACE_4_2_RTSP", "rtsp://admin:Admin@1234@10.50.40.152:554/video/live?channel=1&subtype=0"),
+        # Kept identical to today's paths so existing history isn't touched.
         "data_dir": os.getenv("FURNACE_4_2_DATA_DIR", "data/heats"),
         "index_csv": os.getenv("FURNACE_4_2_INDEX_CSV", "data/heats_index.csv"),
         "heat_id_prefix": "Heat",
+        "influx_group": os.getenv("FURNACE_4_2_INFLUX_GROUP", "SFC4/2"),
+        "pyro_field":   os.getenv("FURNACE_4_2_PYRO_FIELD",   "PYRO4/2"),
     },
 }
+
+# How long to probe each stream at startup to decide if class 28 is present.
+STREAM_PROBE_SECONDS = float(os.getenv("STREAM_PROBE_SECONDS", "6"))
+
+# How long an assigned stream must go without class 3 before the manager
+# treats the furnace behind it as cold and re-evaluates every stream.
+ACTIVEFIRE_TIMEOUT_MINUTES = float(
+    os.getenv("ACTIVEFIRE_TIMEOUT_MINUTES", "5")
+)
+
+# How often the manager's watchdog checks each assigned slot. 30 s means a
+# cold stream is noticed within 30 s of crossing the 5-minute mark, so the
+# worst case from "furnace goes cold" to "re-evaluation starts" is 5m30s.
+SLOT_POLL_SECONDS = float(os.getenv("SLOT_POLL_SECONDS", "30"))
+
+# Duration of each stream's active-fire probe. Probes run in PARALLEL, so
+# total wall-clock cost is this value, not 3× this value.
+PROBE_ACTIVEFIRE_SECONDS = float(os.getenv("PROBE_ACTIVEFIRE_SECONDS", "8"))
+
+# Backward compatibility alias
+STREAM_ACTIVEFIRE_TIMEOUT_MINUTES = ACTIVEFIRE_TIMEOUT_MINUTES
 
 # Which furnace page "/" redirects to.
 DEFAULT_FURNACE_SLUG = "4-2"
 
 # Kept for backward compatibility with scripts (check_sql.py, migrate_csv_to_sql.py
-# when run without --furnace-id, tests) that only ever cared about one furnace.
-FURNACE_ID = os.getenv("FURNACE_ID", FURNACES["4-2"]["furnace_id"])
+# when run without --furnace-id, tests) that still assume a single default.
+FURNACE_ID = os.getenv("FURNACE_ID", FURNACE_SLOTS["4-2"]["furnace_id"])
+
+# Backward compatibility alias for legacy scripts expecting config.FURNACES
+FURNACES = FURNACE_SLOTS
+
+# ---------------------------------------------------------------------------
+# InfluxDB (Temperature / PYRO tracking)
+# ---------------------------------------------------------------------------
+INFLUX_ENABLED = os.getenv("INFLUX_ENABLED", "1").lower() not in ("0", "false", "no")
+INFLUX_URL = os.getenv("INFLUX_URL", "http://13.127.217.106:8086")
+
+# Preferred: API token (InfluxDB 2.x -> Load Data -> API Tokens -> copy).
+# Use read access on the bucket. Set with e.g.
+#     export INFLUX_TOKEN="your-long-token-here"
+# On Windows:  setx INFLUX_TOKEN "your-long-token-here"
+# Leave empty only if the bucket is genuinely world-readable.
+INFLUX_TOKEN = os.getenv("INFLUX_TOKEN", "")
+
+# Alternative when using username/password (older setups):
+#     export INFLUX_USERNAME="admin"
+#     export INFLUX_PASSWORD="..."
+INFLUX_USERNAME = os.getenv("INFLUX_USERNAME", "")
+INFLUX_PASSWORD = os.getenv("INFLUX_PASSWORD", "")
+
+# Confirm these are exactly what the token was issued for:
+#   org id   (InfluxDB 2.x -> Settings -> Organization ID)
+#   bucket   (InfluxDB 2.x -> Load Data -> Buckets -> name)
+INFLUX_ORG_ID = os.getenv("INFLUX_ORG_ID", "065d464f9c4c6b4f")
+INFLUX_ORG = os.getenv("INFLUX_ORG", INFLUX_ORG_ID)
+INFLUX_BUCKET = os.getenv("INFLUX_BUCKET", "MSPRAIGARH")
+INFLUX_MEASUREMENT = os.getenv("INFLUX_MEASUREMENT", "SMS")
+INFLUX_UNIT = os.getenv("INFLUX_UNIT", "SMS_Furnace")
+INFLUX_POLL_SECONDS = float(os.getenv("INFLUX_POLL_SECONDS", "1.0"))
+INFLUX_MAX_AGE_SECONDS = float(os.getenv("INFLUX_MAX_AGE_SECONDS", "5.0"))
+
+# When a furnace movement class becomes confirmed, look slightly backward
+# through recent PYRO samples. This handles YOLO/debounce delay where the
+# temperature may already have changed before class 2/8/18/24/25 is confirmed.
+INFLUX_MOVEMENT_LOOKBACK_SECONDS = float(
+    os.getenv("INFLUX_MOVEMENT_LOOKBACK_SECONDS", "3.0")
+)
 
 # ---------------------------------------------------------------------------
 # Data storage
@@ -108,8 +220,17 @@ FURNACE_ID = os.getenv("FURNACE_ID", FURNACES["4-2"]["furnace_id"])
 # Legacy single-furnace defaults - still used by anything that imports these
 # directly (tests, migrate_csv_to_sql.py's argparse defaults). The running
 # app itself uses each furnace's own data_dir/index_csv from FURNACES above.
-DATA_DIR = FURNACES["4-2"]["data_dir"]        # one CSV per heat lives here
-INDEX_CSV = FURNACES["4-2"]["index_csv"]      # summary row per heat
+DATA_DIR = FURNACE_SLOTS["4-2"]["data_dir"]        # one CSV per heat lives here
+INDEX_CSV = FURNACE_SLOTS["4-2"]["index_csv"]      # summary row per heat
+
+# ---------------------------------------------------------------------------
+# Debug frames
+# ---------------------------------------------------------------------------
+# Every stage start/end queues a "capture this frame" request. CameraWorker
+# writes the raw frame + a small .json sidecar under here, one folder per
+# heat_id, and the dashboard shows them so a transition can be checked
+# against the actual video.
+FRAMES_DIR = os.getenv("FRAMES_DIR", "data/frames")
 
 # ---------------------------------------------------------------------------
 # SQL Server
@@ -167,156 +288,48 @@ FLASK_PORT = 8000
 FLASK_DEBUG = False
 
 # ---------------------------------------------------------------------------
-# Class map (as provided by the updated model export). Maps the model's
-# numeric class IDs to their string names. This is only used as a fallback
-# to translate a raw numeric class_id into its name for a model that
-# doesn't embed its own names in the weights file - detector.py prefers the
-# names embedded in the weights file (self.model.names) when present.
-#
-# IMPORTANT: state_machine.py matches on these NAME strings, not on the
-# numeric IDs below, so the process logic keeps working even if the model
-# is retrained and its classes get renumbered again in future, as long as
-# the class *names* themselves don't change. If a retrain DOES change a
-# class's name (not just its number), update the matching entry in
-# PROCESS_CLASSES below to point at the new name - nothing else needs to
-# change.
+# Class map (as provided). Used only for drawing labels if the weights file
+# does not carry its own names. The state-machine logic matches on the
+# numeric class IDs below, not on these strings, so it keeps working even
+# if your model's label text differs slightly.
 # ---------------------------------------------------------------------------
 CLASS_NAMES = {
-    0: "negitive_sample_otherfurnaces",
-    1: "negitive_sample_pillers",
-    2: "negetive_sample_craenbeem",
-    3: "spange_feeder_farfromfurnace",
-    4: "furnace_bottom_visiblepartially",
-    5: "furnace_position_up",
-    6: "negative_sample_scraponground",
-    7: "spange_feeder_engaged",
-    8: "furnace_operation_activefire",
+    0: "negative_sample_pillers",
+    1: "sponge_feeder_farfromfurnace",
+    2: "furnace_position_up",
+    3: "furnace_operation_activefire",
+    4: "negative_sample_scraponground",
+    5: "negative_sample_otherfurnaces",
+    6: "sponge_feeder_engaged",
+    7: "negative_sample_cranebeam",
+    8: "furnace_bottom_visiblepartially",
     9: "furnace_position_normal",
-    10: "spange_feeder_onfurnace",
-    11: "scrap_mettal_onground",
-    12: "negetive_sample_crainbeem",
-    13: "negitive_sample_sunlight",
-    14: "negitive_sample_fan",
-    15: "magnet_moving_ideal",
+    10: "sponge_feeder_onfurnace",
+    11: "negative_sample_fan",
+    12: "negative_sample_furnacesmoke",
+    13: "laddle_moving_empty",
+    14: "negative_sample_sunlight",
+    15: "magnet_moving_idle",
     16: "magnet_moving_withscrap",
-    17: "sponge_feeder_farfromfurnace",
-    18: "sponge_feeder_notengaged",
-    19: "magnet_feeding_scrap",
-    20: "furnace_position_tilding",
-    21: "negative_sample_slab",
-    22: "negitive_sample_notvisible",
-    23: "laddle_moving_empty",
-    24: "spange_feeder_notengaged",
-    25: "negative_sample_furnacesmoke",
-    26: "furnace_bottom_visiblecompletely",
-    27: "laddle_moving_withmeltiron",
-    28: "magnet_moving_slab",
-    29: "furnace_operation_scrapfeeding",
+    17: "magnet_feeding_scrap",
+    18: "furnace_position_tilting",
+    19: "furnace_operation_scrapfeeding",
+    20: "negative_sample_slag",
+    21: "human_carring_silicomanganese",
+    22: "human_feeding_silicomanganese",
+    23: "negative_sample_notvisible",
+    24: "furnace_bottom_visiblecompletely",
+    25: "laddle_moving_withmeltiron",
+    26: "sponge_feeder_notengaged",
+    27: "magnet_moving_withshaker",
+    28: "furnace_operation_undermaintenance",
+    29: "coil_position_placednearfurnace",
+    30: "negitive_sample_rammingmusscontainer",
+    31: "negative_sample_magnetonground",
+    32: "furma_position_placednearfurnace",
+    33: "furnace_operation_furmareplaced",
+    34: "negative_sample_hanggingcreate",
+    35: "magnet_moving_withsponge",
+    36: "magnet_moving_slag",
+    37: "magnet_feeding_sponge",
 }
-
-# ---------------------------------------------------------------------------
-# Process logic - which class NAME drives which step
-# ---------------------------------------------------------------------------
-# This is the single place that wires a class name to a role in the heat
-# cycle (scrap charging -> sponge charging -> tapping). state_machine.py
-# imports this dict and matches on names only - it never hardcodes a class
-# string itself. So if the model is retrained and a class gets a new name
-# (or you simply want a different signal to drive a step), change the
-# value here and nothing else in the codebase needs to be touched.
-#
-# Every value must be one of the names in CLASS_NAMES above (or, in
-# production, one of the names the model weights themselves embed - see
-# detector.py, which prefers those over CLASS_NAMES).
-PROCESS_CLASSES = {
-    # Detected while IDLE -> a new heat begins and the scrap-charging clock
-    # starts. If this fires while the *previous* heat is still in TAPPING,
-    # that heat is closed out first and the new heat starts from this same
-    # moment.
-    "scrap_charging_start": "magnet_feeding_scrap",
-
-    # Second, independent way to (re)confirm scrap charging is underway:
-    # magnet_moving_withscrap detected with its box positioned just above
-    # furnace_position_normal's box (see MAGNET_ABOVE_FURNACE_* below for
-    # the spatial thresholds). This is a *derived* signal - camera_worker.py
-    # computes it from the two raw boxes each frame and feeds it into the
-    # state machine exactly like any other confirmed class name, under this
-    # name. It is not a class the model itself predicts.
-    "scrap_charging_magnet_alt": "magnet_moving_withscrap_above_furnace_normal",
-
-    # Detected while SCRAP_CHARGING -> scrap charging ends, sponge charging
-    # starts. Either of these two classes is enough.
-    "sponge_charging_start": "spange_feeder_onfurnace",
-    "sponge_charging_start_alt": "spange_feeder_engaged",
-
-    # Furnace back in its normal resting position. Ends TAPPING; also
-    # resolves an open tilt watch back into "that was just a tilt, not
-    # tapping".
-    "furnace_normal": "furnace_position_normal",
-
-    # Furnace visibly leaving the normal position - the only signal tapping
-    # reacts to. See TILT_TO_TAPPING_MINUTES / SPONGE_FAST_TRACK_MINUTES
-    # below and the module docstring in state_machine.py for the two ways
-    # it starts tapping.
-    "furnace_tilting": "furnace_position_tilding",
-    "furnace_tilting_alt": "furnace_position_up",
-
-    # Heartbeat only - every confirmed sighting resets the active-fire
-    # watchdog clock for whatever heat is currently in progress. Doesn't
-    # drive a stage transition on its own.
-    "furnace_activefire": "furnace_operation_activefire",
-}
-
-# ---------------------------------------------------------------------------
-# Process logic - timings
-# ---------------------------------------------------------------------------
-# Scrap charging cannot run longer than this, full stop: if no
-# sponge_charging_start signal has arrived by the time this many minutes
-# have elapsed, the state machine forces the transition into sponge
-# charging anyway (logged with a note), rather than letting scrap charging
-# run indefinitely.
-SCRAP_CHARGING_MAX_MINUTES = 40
-
-# Sponge charging cannot run longer than this, full stop: if tapping hasn't
-# started by the time this many minutes have elapsed, the state machine
-# forces the transition into tapping anyway (logged with a note).
-SPONGE_CHARGING_MAX_MINUTES = 140
-
-# Sponge charging running this long or more -> the first tilt signal seen
-# is immediately taken as tapping starting (no need to also confirm via a
-# return to "normal" first, unlike the normal under-threshold path).
-SPONGE_FAST_TRACK_MINUTES = 130
-
-# furnace_tilting held open this long without furnace_normal confirming it
-# was "just a tilt" -> promoted straight into tapping, backdated to when
-# the tilt itself began. This is one of only two ways tapping can start -
-# see TILT_TO_TAPPING_MINUTES / SPONGE_FAST_TRACK_MINUTES in
-# state_machine.py's module docstring.
-TILT_TO_TAPPING_MINUTES = 3.5
-
-# Tapping cannot run longer than this, full stop: if furnace_position_normal
-# hasn't been detected by the time this many minutes have elapsed, the
-# state machine forces tapping to end (and the heat to complete) anyway,
-# logged with a note.
-TAPPING_MAX_MINUTES = 7
-
-# If a heat is in progress and furnace_activefire hasn't been confirmed for
-# this many minutes, the heat is treated as invalid (camera lost the fire /
-# furnace isn't actually running) and every trace of it is deleted.
-ACTIVEFIRE_TIMEOUT_MINUTES = 50
-
-# ---------------------------------------------------------------------------
-# Process logic - magnet_moving_withscrap "just above" furnace_position_normal
-# ---------------------------------------------------------------------------
-# Used to derive the scrap_charging_magnet_alt signal above from the two raw
-# boxes (magnet_moving_withscrap and furnace_position_normal) on the same
-# frame - see camera_worker.py's _magnet_above_furnace_normal().
-#
-# "Just above" is treated as: the magnet's box sits above the furnace's box
-# (its bottom edge is at or above the furnace box's top edge) by no more
-# than this many pixels of vertical gap...
-MAGNET_ABOVE_FURNACE_MAX_GAP_PX = 80
-
-# ...AND the two boxes overlap horizontally by at least this fraction of the
-# narrower box's width (so a magnet box off to the side, merely at a similar
-# height, doesn't count).
-MAGNET_ABOVE_FURNACE_MIN_OVERLAP_RATIO = 0.15

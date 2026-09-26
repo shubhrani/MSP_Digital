@@ -51,44 +51,6 @@ class FurnaceDetector:
         return detections
 
 
-def magnet_above_furnace_normal(detections, magnet_name, furnace_name,
-                                 max_gap_px=None, min_overlap_ratio=None):
-    """True if any detection named `magnet_name` sits "just above" any
-    detection named `furnace_name` in this same frame's `detections` list
-    (as returned by FurnaceDetector.detect()).
-
-    "Just above" = the magnet box's bottom edge is at or above the furnace
-    box's top edge, the vertical gap between them is no more than
-    `max_gap_px`, and the two boxes overlap horizontally by at least
-    `min_overlap_ratio` of the narrower box's width. Pure geometry, no
-    OpenCV/model calls, so it's cheap to run every processed frame and easy
-    to unit test on its own.
-    """
-    max_gap_px = config.MAGNET_ABOVE_FURNACE_MAX_GAP_PX if max_gap_px is None else max_gap_px
-    min_overlap_ratio = (config.MAGNET_ABOVE_FURNACE_MIN_OVERLAP_RATIO
-                          if min_overlap_ratio is None else min_overlap_ratio)
-
-    magnet_boxes = [d["box"] for d in detections if d["name"] == magnet_name]
-    furnace_boxes = [d["box"] for d in detections if d["name"] == furnace_name]
-    if not magnet_boxes or not furnace_boxes:
-        return False
-
-    for mx1, my1, mx2, my2 in magnet_boxes:
-        for fx1, fy1, fx2, fy2 in furnace_boxes:
-            vertical_gap = fy1 - my2
-            if vertical_gap < 0 or vertical_gap > max_gap_px:
-                continue
-
-            overlap = min(mx2, fx2) - max(mx1, fx1)
-            narrower_width = min(mx2 - mx1, fx2 - fx1)
-            if narrower_width <= 0:
-                continue
-            if (overlap / narrower_width) >= min_overlap_ratio:
-                return True
-
-    return False
-
-
 # Annotation sizing. Bumped up from the original 0.5/1px so labels and the
 # status panel stay readable at normal viewing distance / on a phone.
 BOX_LABEL_FONT_SCALE = 0.75
@@ -97,13 +59,12 @@ STATUS_FONT_SCALE = 0.85
 STATUS_THICKNESS = 2
 
 
-def draw_detections(frame, detections, highlight_names):
+def draw_detections(frame, detections, highlight_class_ids):
     """Draw bounding boxes for every detection, highlighting the classes the
-    state machine actually cares about (matched by name - see
-    state_machine.RELEVANT_CLASS_NAMES)."""
+    state machine actually cares about."""
     for det in detections:
         x1, y1, x2, y2 = [int(v) for v in det["box"]]
-        is_relevant = det["name"] in highlight_names
+        is_relevant = det["class_id"] in highlight_class_ids
         color = COLOR_OF_INTEREST if is_relevant else COLOR_OTHER
         box_thickness = 3 if is_relevant else 2
 

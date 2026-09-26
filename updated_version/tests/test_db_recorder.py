@@ -26,17 +26,18 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import db  # noqa: E402
-from state_machine import ACTIVEFIRE_TIMEOUT_MINUTES, HeatStateMachine  # noqa: E402
+from state_machine import (  # noqa: E402
+    HeatStateMachine,
+    CLS_MAGNET_FEEDING_SCRAP,
+    CLS_SPONGE_FEEDER_ON_FURNACE,
+    CLS_FURNACE_TILTING,
+    CLS_FURNACE_BOTTOM_VISIBLE_COMPLETELY,
+    CLS_LADDLE_MOVING_WITHMELTIRON,
+    CLS_FURNACE_NORMAL,
+)
 
 TMP_DIR = os.path.join(os.path.dirname(__file__), "_tmp_db")
 BASE = datetime.datetime(2026, 8, 11, 8, 0, 0)
-
-# Class names, matching state_machine.CLS_* (see the new model's class map
-# in config.py) - detections are fed in by name, not by numeric class ID.
-MAGNET_FEEDING_SCRAP = "magnet_feeding_scrap"
-SPONGE_FEEDER_ON_FURNACE = "spange_feeder_onfurnace"
-FURNACE_TILTING = "furnace_position_tilding"
-FURNACE_NORMAL = "furnace_position_normal"
 
 
 def t(minutes_offset):
@@ -50,7 +51,7 @@ def hb(sm, minutes_offset):
     sm.note_activefire_seen(t(minutes_offset))
 
 
-def keep_alive(sm, start, end, step=8):
+def keep_alive(sm, start, end, step=2):
     m = start
     while m < end:
         hb(sm, m)
@@ -151,25 +152,61 @@ def install_fake_pyodbc():
     return registry
 
 
+class MockTemperatureMonitor:
+    def __init__(self, temp=1560.0):
+        self.temp = None
+        self.seq = 0
+        self.history = []
+        if temp is not None:
+            self.set_temperature(temp)
+
+    def get_temperature(self):
+        return self.temp
+
+    def get_latest(self):
+        return {
+            "value": self.temp,
+            "seq": self.seq,
+            "is_stale": False,
+            "connected": True,
+            "last_error": None,
+            "data_age_seconds": 0.0,
+        }
+
+    def get_recent_samples(self, seconds=None):
+        return list(self.history)
+
+    def set_temperature(self, new_temp):
+        self.seq += 1
+        self.temp = new_temp
+        self.history.append({
+            "seq": self.seq,
+            "value": new_temp,
+            "source_timestamp": None,
+            "received_monotonic": 0,
+        })
+
+
 # ---------------------------------------------------------------------------
 def test_state_machine_feeds_the_recorder():
     """Every CSV row should reach the recorder with matching values."""
     fresh_tmp()
     rec = RecordingRecorder()
+    temp_mon = MockTemperatureMonitor(1560.0)
     sm = HeatStateMachine(data_dir=os.path.join(TMP_DIR, "heats"),
                           index_csv=os.path.join(TMP_DIR, "heats_index.csv"),
-                          recorder=rec)
+                          recorder=rec,
+                          temperature_monitor=temp_mon)
 
-    sm.process_detections({MAGNET_FEEDING_SCRAP}, t(0))            # heat starts
-    keep_alive(sm, 8, 25)
-    sm.process_detections({SPONGE_FEEDER_ON_FURNACE}, t(25))       # scrap -> sponge
-    keep_alive(sm, 33, 70)
-    sm.process_detections({FURNACE_TILTING}, t(70))                # tilt begins (< 130 min sponge)
-    sm.process_detections({FURNACE_NORMAL}, t(71))                 # tilt resolves, counted
-    keep_alive(sm, 79, 160)
-    sm.process_detections({FURNACE_TILTING}, t(160))               # >= 130 min sponge -> tapping starts
-    keep_alive(sm, 168, 175)
-    sm.process_detections({FURNACE_NORMAL}, t(175))                # furnace back to normal -> tapping ends
+    sm.process_detections({CLS_MAGNET_FEEDING_SCRAP}, t(0))            # heat starts
+    keep_alive(sm, 2, 25)
+    sm.process_detections({CLS_SPONGE_FEEDER_ON_FURNACE}, t(25))           # scrap -> sponge
+    keep_alive(sm, 27, 70)
+    # Class 24 opens tapping check at 71.5m (90s pre-roll backdates tapping start to 70m)
+    t24 = t(70) + datetime.timedelta(seconds=90)
+    sm.process_detections({CLS_FURNACE_BOTTOM_VISIBLE_COMPLETELY}, t24)
+    temp_mon.set_temperature(1565.0)
+    sm.check_timeouts(t(72))           # tapping confirmed and completed at t(72)
 
     starts = rec.of("heat_start")
     assert len(starts) == 1, starts
@@ -181,11 +218,11 @@ def test_state_machine_feeds_the_recorder():
     by_name = {e["event_name"]: e for e in events}
     assert by_name["scrap_charging"]["duration_minutes"] == 25.0
     assert by_name["scrap_charging"]["start_time"] == t(0)
-    assert by_name["sponge_charging"]["duration_minutes"] == 135.0
-    assert by_name["tapping"]["duration_minutes"] == 15.0
-    assert by_name["tilt"]["tilt_number"] == 1
-    # The tapping row carries why the heat ended.
-    assert "normal" in (by_name["tapping"]["note"] or "")
+    assert by_name["sponge_charging"]["duration_minutes"] == 45.0
+    assert by_name["tapping"]["duration_minutes"] == 2.0
+    assert "tilt" not in by_name
+    # The tapping row carries why tapping confirmed/ended.
+    assert "furnace_bottom_visiblecompletely" in (by_name["tapping"]["note"] or "")
 
     # Ordinals must match the row order in the CSV, since that's what
     # makes the event keys line up with a later CSV backfill. Only rows
@@ -199,9 +236,9 @@ def test_state_machine_feeds_the_recorder():
     ends = rec.of("heat_end")
     assert len(ends) == 1
     assert ends[0]["status"] == "COMPLETE"
-    assert ends[0]["tilt_count"] == 1
-    assert ends[0]["end_time"] == t(175)
-    assert ends[0]["duration_minutes"] == 175.0   # t(0) -> t(175)
+    assert ends[0]["tilt_count"] == 0
+    assert ends[0]["end_time"] == t(72)
+    assert ends[0]["duration_minutes"] == 72.0   # t(0) -> t(72)
 
     print("test_state_machine_feeds_the_recorder passed.")
 
@@ -211,10 +248,10 @@ def test_no_recorder_is_csv_only():
     fresh_tmp()
     sm = HeatStateMachine(data_dir=os.path.join(TMP_DIR, "heats"),
                           index_csv=os.path.join(TMP_DIR, "heats_index.csv"))
-    sm.process_detections({MAGNET_FEEDING_SCRAP}, t(0))
+    sm.process_detections({CLS_MAGNET_FEEDING_SCRAP}, t(0))
     heat_id = sm.heat_id
-    keep_alive(sm, 8, 25)
-    sm.process_detections({SPONGE_FEEDER_ON_FURNACE}, t(25))
+    keep_alive(sm, 2, 25)
+    sm.process_detections({CLS_SPONGE_FEEDER_ON_FURNACE}, t(25))
     assert sm.recorder is None
     assert sm.heat_id == heat_id, "heat should still be the one started at t(0)"
     assert sm.state == sm.STATE_SPONGE_CHARGING
@@ -232,12 +269,12 @@ def test_activefire_watchdog_notifies_recorder():
                           index_csv=os.path.join(TMP_DIR, "heats_index.csv"),
                           recorder=rec, furnace_id="4/2")
 
-    sm.process_detections({MAGNET_FEEDING_SCRAP}, t(0))   # heat starts, no activefire ever
+    sm.process_detections({CLS_MAGNET_FEEDING_SCRAP}, t(0))            # heat starts, no class 3 ever
     heat_id = sm.heat_id
     csv_path = sm.get_heat_csv_path(heat_id)
     assert os.path.exists(csv_path)
 
-    sm.check_timeouts(t(ACTIVEFIRE_TIMEOUT_MINUTES + 0.5))  # past the timeout
+    sm.check_timeouts(t(5.5))                  # past the 5-minute timeout
 
     assert sm.state == sm.STATE_IDLE
     assert not os.path.exists(csv_path)

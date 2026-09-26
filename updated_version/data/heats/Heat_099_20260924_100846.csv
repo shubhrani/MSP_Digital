@@ -1,0 +1,7 @@
+event,start_time,end_time,duration_minutes,tilt_number,note
+scrap_charging_unknown,,,,,app started during sponge charging
+tilt,2026-09-24T10:14:31.804840,2026-09-24T10:15:25.420137,0.89,1,
+tilt,2026-09-24T10:19:19.766307,2026-09-24T10:20:27.618512,1.13,2,
+tilt,2026-09-24T10:38:49.375538,2026-09-24T10:39:31.005740,0.69,3,
+sponge_charging,2026-09-24T10:08:46.005871,2026-09-24T10:50:33.546681,41.79,,PYRO4/2 changed 1625.145 -> 1669.473 after furnace_bottom_visiblecompletely (24)
+tapping,2026-09-24T10:50:33.546681,2026-09-24T10:52:26.979354,1.89,,PYRO4/2 changed 1625.145 -> 1669.473 after furnace_bottom_visiblecompletely (24)

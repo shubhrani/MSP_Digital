@@ -1,0 +1,4 @@
+event,start_time,end_time,duration_minutes,tilt_number,note
+scrap_charging,2026-09-19T01:13:24.838319,2026-09-19T02:04:33.120174,51.14,,
+sponge_charging,2026-09-19T02:04:33.120174,2026-09-19T02:06:20.336177,1.79,,furnace position up
+tapping,2026-09-19T02:06:20.336177,2026-09-19T02:06:21.586598,0.02,,scrap feeding detected
