@@ -1,7 +1,7 @@
 from ultralytics import YOLO
 
 # Path to your best.pt
-MODEL_PATH = r"C:\Users\shubh\PythonProjects\MSP_Digital\Updated_version\models\furnace_monitor_best.pt"
+MODEL_PATH = r"C:\Users\shubh\PythonProjects\MSP_Digital\Updated_version\models\furnace_24.09.pt"
 
 # Load model
 model = YOLO(MODEL_PATH)

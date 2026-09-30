@@ -1,0 +1,4 @@
+event,start_time,end_time,duration_minutes,tilt_number,note
+scrap_charging,2026-09-19T11:42:40.489372,2026-09-19T11:42:44.139611,0.06,,
+sponge_charging,2026-09-19T11:42:44.139611,2026-09-19T12:14:17.015460,31.55,,class 24 followed by class 25; tapping backdated 50 seconds
+tapping,2026-09-19T12:14:17.015460,2026-09-19T12:17:11.160601,2.9,,furnace returned to normal

@@ -1,0 +1,4 @@
+event,start_time,end_time,duration_minutes,tilt_number,note
+scrap_charging_unknown,,,,,
+tilt,2026-08-13T17:10:07.491733,2026-08-13T17:10:09.205358,0.03,1,
+tilt_ignored_cooldown,2026-08-13T17:10:10.245755,2026-08-13T17:11:37.556562,1.46,,

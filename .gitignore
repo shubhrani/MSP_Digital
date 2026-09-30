@@ -6,6 +6,7 @@ Updated_version/venv/
 updated_version/venv/
 .env
 *.env
+*.log
 
 # Ephemeral root test output
 /data/

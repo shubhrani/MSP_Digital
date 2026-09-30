@@ -1,0 +1,6 @@
+event,start_time,end_time,duration_minutes,tilt_number,note
+scrap_charging_unknown,,,,,
+tilt,2026-08-14T14:21:33.472782,2026-08-14T14:22:41.777369,1.14,1,
+tilt,2026-08-14T14:36:13.340850,2026-08-14T14:36:40.012400,0.44,2,
+tilt,2026-08-14T14:44:32.560614,2026-08-14T14:44:51.144336,0.31,3,
+sponge_charging,2026-08-14T13:19:14.862848,2026-08-14T16:01:14.530361,161.99,,>130 min sponge charging

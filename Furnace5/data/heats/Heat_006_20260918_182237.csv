@@ -1,0 +1,4 @@
+event,start_time,end_time,duration_minutes,tilt_number,note
+scrap_charging,2026-09-18T18:22:37.733450,2026-09-18T18:41:14.218206,18.61,,
+sponge_charging,2026-09-18T18:41:14.218206,2026-09-18T18:51:51.949079,10.63,,ladle moving with molten iron
+tapping,2026-09-18T18:51:51.949079,2026-09-18T18:59:06.532503,7.24,,furnace returned to normal

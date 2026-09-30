@@ -1,0 +1,2 @@
+heat_id,start_time,end_time,duration_minutes,tilt_count,status,csv_file
+Heat51_001_20260929_145410,2026-09-29T14:54:10.798292,,,0,IN_PROGRESS,Heat51_001_20260929_145410.csv
