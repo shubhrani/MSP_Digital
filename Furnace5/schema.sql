@@ -6,7 +6,7 @@
 -- the application login should not have DDL rights.
 --
 -- FurnaceId: every row is tagged with the FurnaceId of the deployment
--- that wrote it (config.FURNACE_ID, e.g. '5/1'). Heats and HeatEvents
+-- that wrote it (config.FURNACE_ID, e.g. '4/2'). Heats and HeatEvents
 -- are shared tables across furnaces - filter or GROUP BY FurnaceId to
 -- keep each furnace's data segregated in analysis (vw_HeatDaily is now
 -- grouped by FurnaceId + HeatDate; see sql/analysis_queries.sql for

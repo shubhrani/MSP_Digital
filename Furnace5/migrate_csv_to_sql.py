@@ -35,10 +35,6 @@ def main():
                              "Picks that furnace's own data-dir/index-csv unless overridden below.")
     parser.add_argument("--data-dir", default=None)
     parser.add_argument("--index-csv", default=None)
-    parser.add_argument("--all", action="store_true",
-                        help="Sync all historical CSVs regardless of date. By default, only today's data is synced.")
-    parser.add_argument("--since", default=None,
-                        help="Sync data on or after this date (YYYY-MM-DD). Defaults to today unless --all is passed.")
     args = parser.parse_args()
 
     # Resolve data-dir/index-csv from the chosen furnace unless the caller
@@ -48,10 +44,6 @@ def main():
     data_dir = args.data_dir or (furnace_cfg["data_dir"] if furnace_cfg else config.DATA_DIR)
     index_csv = args.index_csv or (furnace_cfg["index_csv"] if furnace_cfg else config.INDEX_CSV)
 
-    today_only = False if args.all else (True if not args.since else False)
-    since_date = args.since if not args.all else None
-    filter_desc = "All historical data (--all)" if args.all else (f"Since {args.since}" if args.since else "Today and now only (default)")
-
     print("=" * 62)
     print("CSV -> SQL SERVER BACKFILL")
     print("=" * 62)
@@ -59,7 +51,6 @@ def main():
     print(f"Index file   : {index_csv}")
     print(f"Heat files   : {data_dir}")
     print(f"Target       : {config.SQL_SERVER} / {config.SQL_DATABASE}")
-    print(f"Filter       : {filter_desc}")
     print(f"Mode         : {'DRY RUN - nothing will be written' if args.dry_run else 'WRITE'}")
     print("=" * 62)
 
@@ -68,8 +59,6 @@ def main():
                                   index_csv=index_csv,
                                   furnace_id=args.furnace_id,
                                   dry_run=args.dry_run,
-                                  today_only=today_only,
-                                  since_date=since_date,
                                   emit=print)
     except Exception as exc:
         print(f"\nFAILED: {exc}")
@@ -82,8 +71,6 @@ def main():
     else:
         print(f"Loaded {result['heats_written']} heat row(s) and "
               f"{result['events_written']} event row(s).")
-        if result.get("heats_filtered_prior_date"):
-            print(f"Skipped {result['heats_filtered_prior_date']} historical heat(s) prior to cutoff date.")
         if "heats_total" in result:
             print(f"Database now holds {result['heats_total']} heat(s) and "
                   f"{result['events_total']} event(s).")

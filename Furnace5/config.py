@@ -16,6 +16,12 @@ if os.path.isfile(_env_path):
             _k, _v = _line.split("=", 1)
             os.environ.setdefault(_k.strip(), _v.strip().strip('"').strip("'"))
 
+# Force RTSP over TCP and a sane socket timeout (5s) for every OpenCV VideoCapture across the app.
+os.environ.setdefault(
+    "OPENCV_FFMPEG_CAPTURE_OPTIONS",
+    "rtsp_transport;tcp|stimeout;5000000|max_delay;500000",
+)
+
 # ---------------------------------------------------------------------------
 # Camera / stream
 # ---------------------------------------------------------------------------
@@ -23,7 +29,7 @@ if os.path.isfile(_env_path):
 # Kept for backward compatibility with anything that still imports
 # config.RTSP_URL directly (tests, one-off scripts). The running app itself
 # reads the per-furnace URL out of FURNACES below.
-RTSP_URL = "rtsp://admin:Admin%401234@10.50.40.160:554/video/live?channel=1&subtype=0"
+RTSP_URL = "rtsp://admin:Admin%401234@10.50.40.158:554"
 
 # If the RTSP connection drops, wait this many seconds before retrying.
 RECONNECT_DELAY_SECONDS = 10
@@ -36,7 +42,7 @@ MODEL_PATH = os.getenv(
 )
 
 # Minimum confidence for a detection to be considered at all.
-CONFIDENCE_THRESHOLD = 0.5
+CONFIDENCE_THRESHOLD = 0.3
 
 # Run detection on every Nth frame (1 = every frame). Raise this on slower
 # hardware / CPU-only machines to keep the video feed smooth. The video
@@ -50,7 +56,7 @@ PROCESS_EVERY_N_FRAMES = 2
 DEBOUNCE_FRAMES = 5
 
 # JPEG quality used for the MJPEG stream served to the browser (1-100).
-JPEG_QUALITY = 80
+JPEG_QUALITY = 60
 
 # ---------------------------------------------------------------------------
 # Furnaces
@@ -75,22 +81,23 @@ JPEG_QUALITY = 80
 #                      prefix free of underscores (it's split on "_" to parse
 #                      the heat number back out).
 #
-# 5/2 keeps its own data_dir/index_csv/prefix ("data/heats_5_2",
-# "data/heats_index_5_2.csv", "Heat52"). 5/1 is a deployment with its own files
-# ("data/heats_5_1", "data/heats_index_5_1.csv", "Heat51").
+# 5/2 keeps the exact same data_dir/index_csv/prefix ("data/heats",
+# "data/heats_index.csv", "Heat") it already uses today, so this update
+# doesn't touch or renumber the heat history already on disk / in SQL for
+# that furnace. 5/1 is a fresh deployment with its own files.
 #
 # Every value can be overridden by an environment variable, so the same zip
 # can be copied between machines without editing this file - e.g. if a
 # camera's IP or credentials change:
-#     export FURNACE_5_1_RTSP="rtsp://user:pass@10.50.40.160:554/..."
-#     export FURNACE_5_2_RTSP="rtsp://user:pass@10.50.40.158:554/..."
+#     export FURNACE_5_1_RTSP="rtsp://user:pass@10.50.40.158:554/..."
+#     export FURNACE_5_2_RTSP="rtsp://user:pass@10.50.40.159:554/..."
 # ---------------------------------------------------------------------------
 # Physical camera streams (3 of them) — camera only, no PYRO here.
 # ---------------------------------------------------------------------------
 STREAMS = [
     {
         "stream_id": "stream-1",
-        "name": "Camera 10.50.40.160",
+        "name": "Camera 10.50.40.158",
         "rtsp_url": os.getenv(
             "STREAM_1_RTSP",
             "rtsp://admin:Admin%401234@10.50.40.158:554",
@@ -98,7 +105,7 @@ STREAMS = [
     },
     {
         "stream_id": "stream-2",
-        "name": "Camera 10.50.40.158",
+        "name": "Camera 10.50.40.159",
         "rtsp_url": os.getenv(
             "STREAM_2_RTSP",
             "rtsp://admin:Admin%401234@10.50.40.159:554",
@@ -106,7 +113,7 @@ STREAMS = [
     },
     {
         "stream_id": "stream-3",
-        "name": "Camera 10.50.40.159",
+        "name": "Camera 10.50.40.160",
         "rtsp_url": os.getenv(
             "STREAM_3_RTSP",
             "rtsp://admin:Admin%401234@10.50.40.160:554",
@@ -136,9 +143,9 @@ FURNACE_SLOTS = {
     "5-2": {
         "furnace_id": "5/2",
         "name": "Furnace 5/2",
-        "data_dir": os.getenv("FURNACE_5_2_DATA_DIR", "data/heats_5_2"),
-        "index_csv": os.getenv("FURNACE_5_2_INDEX_CSV", "data/heats_index_5_2.csv"),
-        "heat_id_prefix": "Heat52",
+        "data_dir": os.getenv("FURNACE_5_2_DATA_DIR", "data/heats"),
+        "index_csv": os.getenv("FURNACE_5_2_INDEX_CSV", "data/heats_index.csv"),
+        "heat_id_prefix": "Heat",
         "influx_group": os.getenv("FURNACE_5_2_INFLUX_GROUP", "SFC5/2"),
         "pyro_field":   os.getenv("FURNACE_5_2_PYRO_FIELD",   "PYRO5/2"),
     },
@@ -166,6 +173,45 @@ SLOT_POLL_SECONDS = float(os.getenv("SLOT_POLL_SECONDS", "30"))
 # Duration of each stream's active-fire probe. Probes run in PARALLEL, so
 # total wall-clock cost is this value, not 3× this value.
 PROBE_ACTIVEFIRE_SECONDS = float(os.getenv("PROBE_ACTIVEFIRE_SECONDS", "8"))
+
+# Dedicated window for the active-fire check during RTSP (re)allocation.
+# Deliberately longer than the maintenance-resume probe: a camera that
+# has just been powered on or reconnected may take a few seconds to
+# produce frames, and the debouncer needs DEBOUNCE_FRAMES consecutive
+# detections before it will confirm class 5. 30s is enough for both.
+ALLOCATION_ACTIVEFIRE_PROBE_SECONDS = float(
+    os.getenv("ALLOCATION_ACTIVEFIRE_PROBE_SECONDS", "30")
+)
+
+# How often the allocation probe logs its remaining time, in seconds.
+# Purely informational — operators watch the log while a swap is running.
+ALLOCATION_PROBE_TICK_SECONDS = float(
+    os.getenv("ALLOCATION_PROBE_TICK_SECONDS", "5")
+)
+
+# ---------------------------------------------------------------------------
+# Cold-stream watchdog
+# ---------------------------------------------------------------------------
+# When a slot has been holding a stream that hasn't seen active fire
+# (class 5) for this many minutes, the watchdog starts probing the
+# *unassigned* spare streams for fire. If a spare is hotter than the
+# slot's own stream, a re-evaluation is triggered so the hotter camera
+# can take over.
+#
+# This matters most when exactly one stream has fire: the first
+# re-evaluation puts the hot stream on the desired slot and a cold
+# stream on the other, and this watchdog is what notices when the
+# second camera comes up.
+COLD_STREAM_MIN_COLD_MINUTES = float(
+    os.getenv("COLD_STREAM_MIN_COLD_MINUTES", "3")
+)
+
+# Minimum gap between two consecutive cold-stream probes. Probing a
+# spare briefly opens an RTSP connection for PROBE_ACTIVEFIRE_SECONDS,
+# so keep this comfortably larger than that.
+COLD_STREAM_WATCH_SECONDS = float(
+    os.getenv("COLD_STREAM_WATCH_SECONDS", "90")
+)
 
 # Backward compatibility alias
 STREAM_ACTIVEFIRE_TIMEOUT_MINUTES = ACTIVEFIRE_TIMEOUT_MINUTES
@@ -281,7 +327,7 @@ SQL_SPOOL_FILE = "data/sql_spool.jsonl"
 # On startup, push any heat CSVs that aren't in the database yet - in a
 # background thread, so it never delays the camera or the dashboard.
 # Idempotent: re-running it inserts nothing new.
-SQL_BACKFILL_ON_START = True
+SQL_BACKFILL_ON_START = False
 
 # ---------------------------------------------------------------------------
 # Database Sync Date Filtering
@@ -296,13 +342,31 @@ SYNC_TODAY_ONLY = os.getenv("SYNC_TODAY_ONLY", "1").lower() not in ("0", "false"
 # will be synced. When empty and SYNC_TODAY_ONLY is True, defaults to today.
 SYNC_SINCE_DATE = os.getenv("SYNC_SINCE_DATE", "")
 
+# ---------------------------------------------------------------------------
+# Startup recovery
+# ---------------------------------------------------------------------------
+# On startup, the state machine looks for the most recent IN_PROGRESS heat
+# in its CSV index. If that heat started within this many minutes, its
+# state (heat_id, stage, scrap/sponge/tapping start times, tilt count,
+# event ordinal) is restored from the CSV so the app keeps writing into
+# the same heat instead of starting a new one.
+#
+# Older IN_PROGRESS heats are marked ABORTED (never deleted - the CSV is
+# kept for audit) and a fresh heat is started when the next scrap class
+# arrives, as before.
+#
+# Set to 0 to disable resumption entirely (every restart = fresh heat).
+RESUME_INCOMPLETE_HEAT_MAX_MINUTES = float(
+    os.getenv("RESUME_INCOMPLETE_HEAT_MAX_MINUTES", "120")   # was 20
+)
+
 
 # ---------------------------------------------------------------------------
 # Flask
 # ---------------------------------------------------------------------------
-FLASK_HOST = "0.0.0.0"
-FLASK_PORT = 5555
-FLASK_DEBUG = False
+FLASK_HOST = os.getenv("FLASK_HOST", "0.0.0.0")
+FLASK_PORT = int(os.getenv("FLASK_PORT", "5555"))
+FLASK_DEBUG = os.getenv("FLASK_DEBUG", "0").lower() in ("1", "true", "yes")
 
 # ---------------------------------------------------------------------------
 # Class map (as provided). Used only for drawing labels if the weights file

@@ -1,9 +1,9 @@
 # Furnace Process Monitor
 
-> **Now watching two furnaces.** This app runs both 5/1 and 5/2 out of one
+> **Now watching two furnaces.** This app runs both 4/1 and 4/2 out of one
 > Flask process, each with its own camera, own dashboard page, and own CSV
 > files, all pushed into the same SQL Server database segregated by
-> `FurnaceId`. See `config.py`'s `FURNACE_SLOTS` dict to change either camera's
+> `FurnaceId`. See `config.py`'s `FURNACES` dict to change either camera's
 > RTSP URL, and jump to **"Two furnaces, one app"** below for the details.
 
 A Flask dashboard that watches an RTSP camera feed with a YOLOv11
@@ -20,47 +20,48 @@ furnace_monitor/
 ├── state_machine.py    The actual process logic (pure Python, unit tested)
 ├── debounce.py         Filters single-frame detection flicker
 ├── config.py           All the settings you're likely to want to change,
-│                        including FURNACE_SLOTS (per-furnace camera/CSV config)
+│                        including FURNACES (per-furnace camera/CSV config)
 ├── templates/dashboard.html   one furnace's page (rendered per-furnace)
 ├── templates/home.html        furnace picker (only used as a fallback)
 ├── static/css/style.css
 ├── static/js/dashboard.js
 ├── models/              <- put best.pt here (shared by both furnaces)
-├── data/heats_5_2/            5/2's per-heat CSVs
-├── data/heats_index_5_2.csv   5/2's heat summary CSV
-├── data/heats_5_1/            5/1's per-heat CSVs
-├── data/heats_index_5_1.csv   5/1's heat summary CSV
+├── data/heats/                4/2's per-heat CSVs (existing, unchanged)
+├── data/heats_index.csv       4/2's heat summary CSV (existing, unchanged)
+├── data/heats_4_1/            4/1's per-heat CSVs (new)
+├── data/heats_index_4_1.csv   4/1's heat summary CSV (new)
 └── tests/test_state_machine.py   run with `python3 tests/test_state_machine.py`
 ```
 
 ## 0. Two furnaces, one app
 
-`config.py` has a `FURNACE_SLOTS` dict with one entry per furnace - each one's
-`rtsp_url`, `data_dir`, `index_csv`, and `heat_id_prefix`. 5/1 and 5/2 each have
-their own dedicated directories and summary CSVs.
+`config.py` has a `FURNACES` dict with one entry per furnace - each one's
+`rtsp_url`, `data_dir`, `index_csv`, and `heat_id_prefix`. 4/2 keeps the
+exact paths it already used (`data/heats`, `data/heats_index.csv`), so
+upgrading to this version doesn't touch or renumber its existing history.
+4/1 is new and gets its own files.
 
 Once running (`python3 app.py`), each furnace has its own page:
 
 ```
-http://<machine-ip>:8000/furnace/5-1
-http://<machine-ip>:8000/furnace/5-2
+http://<machine-ip>:8000/furnace/4-1
+http://<machine-ip>:8000/furnace/4-2
 ```
 
 `http://<machine-ip>:8000/` redirects to the default furnace
 (`config.DEFAULT_FURNACE_SLUG`); a small switcher in the top bar of each
 dashboard flips between the two. Both furnaces write into the *same* SQL
 Server `Heats`/`HeatEvents` tables - every row carries a `FurnaceId`
-column (`5/1` or `5/2`) so a query like
-`SELECT * FROM Heats WHERE FurnaceId = '5/1'` (see
+column (`4/1` or `4/2`) so a query like
+`SELECT * FROM Heats WHERE FurnaceId = '4/1'` (see
 `sql/analysis_queries.sql`) gets just that furnace's data back.
 
 To point either camera at a different URL without editing `config.py`,
 set the matching environment variable before `python3 app.py`:
 
 ```bash
-export STREAM_1_RTSP="rtsp://admin:Admin%401234@10.50.40.160:554/video/live?channel=1&subtype=0"
-export STREAM_2_RTSP="rtsp://admin:Admin%401234@10.50.40.158:554/video/live?channel=1&subtype=0"
-export STREAM_3_RTSP="rtsp://admin:Admin%401234@10.50.40.159:554/video/live?channel=1&subtype=0"
+export FURNACE_4_1_RTSP="rtsp://user:pass@10.50.40.151:554/video/live?channel=1&subtype=0"
+export FURNACE_4_2_RTSP="rtsp://user:pass@10.50.40.152:554/video/live?channel=1&subtype=0"
 ```
 
 Both furnaces currently load their own copy of the YOLO model (one per
@@ -74,8 +75,8 @@ To backfill one furnace's CSV history into SQL Server by hand (the app
 already does this automatically in the background on startup):
 
 ```bash
-python3 migrate_csv_to_sql.py --furnace-id 5/1
-python3 migrate_csv_to_sql.py --furnace-id 5/2 --dry-run
+python3 migrate_csv_to_sql.py --furnace-id 4/1
+python3 migrate_csv_to_sql.py --furnace-id 4/2 --dry-run
 ```
 
 
@@ -132,7 +133,7 @@ new frame published since the last one sent) are never resent.
 
 The process logic matches the **numeric class IDs** from the 43-class YOLO model. The production sequence is strictly maintained inside one heat:
 
-**Scrap charging (24, 21, or 37) -> Sponge charging (15, 4, 6, 19, 27, or 2) -> Tapping (18 + Ladle 25/36 or PYRO) -> Normal (1) -> COMPLETE**
+**Scrap charging (24, 21, or 37) -> Sponge charging (15, 4, 6, 19, 27, or 2) -> Tapping (18 + Ladle 25, or 36) -> Normal (1) -> COMPLETE**
 
 | ID | Class | Effect |
 |----|-------|--------|
@@ -157,6 +158,7 @@ The process logic matches the **numeric class IDs** from the 43-class YOLO model
 | 29 | `magnet_moving_slag` | Logged as slag removal events (`slag_removal`) in `HeatEvents`. |
 | 28 | `furnace_operation_undermaintenance` | Flagged as maintenance in status and stream management. |
 | 0 | `coil_position_placednearfurnace` | Direct maintenance detection class. |
+| 7 | `furnace_operation_preheating` | Direct maintenance detection class. |
 | 39 | `furma_position_placednearfurnace` | Direct maintenance detection class. |
 | 31 | `furnace_operation_furmareplaced` | Direct maintenance detection class. |
 

@@ -207,8 +207,7 @@ def test_state_machine_feeds_the_recorder():
     # Class 24 opens tapping check at 71.5m (90s pre-roll backdates tapping start to 70m)
     t24 = t(70) + datetime.timedelta(seconds=90)
     sm.process_detections({CLS_FURNACE_BOTTOM_VISIBLE_COMPLETELY}, t24)
-    temp_mon.set_temperature(1565.0)
-    sm.check_timeouts(t(72))           # tapping confirmed and completed at t(72)
+    sm.process_detections({CLS_LADDLE_MOVING_WITHMELTIRON}, t(72))           # tapping confirmed and completed at t(72)
 
     starts = rec.of("heat_start")
     assert len(starts) == 1, starts

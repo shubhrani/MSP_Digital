@@ -20,8 +20,11 @@ import json
 import logging
 import os
 import threading
+import time
 
 from flask import Flask, Response, jsonify, redirect, render_template, request, send_file, url_for, abort
+import cv2
+import numpy as np
 
 import config
 import db
@@ -38,6 +41,17 @@ app = Flask(__name__)
 # furnaces this process is watching.
 sql_recorder = db.SqlRecorder()
 manager = FurnaceManager(recorder=sql_recorder)
+
+
+def _make_placeholder_frame(message="Connecting camera feed..."):
+    frame = np.zeros((480, 854, 3), dtype="uint8")
+    frame[:] = (17, 19, 23)
+    cv2.putText(
+        frame, message, (40, 240), cv2.FONT_HERSHEY_SIMPLEX,
+        0.9, (138, 147, 160), 2, cv2.LINE_AA,
+    )
+    ok, jpeg = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), config.JPEG_QUALITY])
+    return jpeg.tobytes() if ok else b""
 
 
 def _get_slot_or_404(slug):
@@ -66,40 +80,36 @@ def dashboard(slug):
     )
 
 
-def _placeholder_generator(message="Waiting for camera stream..."):
-    import cv2
-    import numpy as np
-    import time
-    frame = np.zeros((480, 854, 3), dtype="uint8")
-    frame[:] = (17, 19, 23)
-    cv2.putText(frame, message, (40, 240), cv2.FONT_HERSHEY_SIMPLEX,
-                0.8, (138, 147, 160), 2, cv2.LINE_AA)
-    ok, jpeg = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), config.JPEG_QUALITY])
-    if ok:
-        boundary = b"--frame"
-        body = boundary + b"\r\nContent-Type: image/jpeg\r\n\r\n" + jpeg.tobytes() + b"\r\n"
-        while True:
-            yield body
-            time.sleep(1.0)
-
-
-def _mjpeg_generator(camera_worker):
-    """Streams each frame to the browser the moment camera_worker publishes
-    it (pushed via camera_worker.frames(), which itself yields), rather
-    than polling get_jpeg() on a fixed timer - lower latency and no
-    redundant re-sends of a frame that hasn't changed."""
+def _mjpeg_generator(slot):
+    """Streams frames from whichever CameraWorker is *currently* attached
+    to the slot. If the slot is mid-swap (maintenance -> spare), we yield
+    a placeholder frame so the browser's <img> never goes blank, and wait
+    for the new worker to bind and stream."""
     boundary = b"--frame"
-    for jpeg in camera_worker.frames():
-        yield (boundary + b"\r\nContent-Type: image/jpeg\r\n\r\n" + jpeg + b"\r\n")
+    while True:
+        worker = slot.camera_worker
+        if worker is None:
+            # No worker attached yet (mid-swap or initializing).
+            # Yield placeholder so browser doesn't show blank/broken feed.
+            placeholder = _make_placeholder_frame(f"Connecting feed for {slot.name}...")
+            if placeholder:
+                yield (boundary + b"\r\nContent-Type: image/jpeg\r\n\r\n"
+                       + placeholder + b"\r\n")
+            time.sleep(0.5)
+            continue
+        # Stream from this worker until it stops (i.e. the slot is swapped).
+        for jpeg in worker.frames():
+            yield (boundary + b"\r\nContent-Type: image/jpeg\r\n\r\n"
+                   + jpeg + b"\r\n")
+        # The worker exited. The slot may already have a new one (swap
+        # already happened) or not yet (still attaching); loop back.
+        time.sleep(0.25)
 
 
 @app.route("/furnace/<slug>/video_feed")
 def video_feed(slug):
     slot = _get_slot_or_404(slug)
-    if not slot.camera_worker:
-        return Response(_placeholder_generator(f"{slot.name} - Waiting for camera..."),
-                        mimetype="multipart/x-mixed-replace; boundary=frame")
-    return Response(_mjpeg_generator(slot.camera_worker),
+    return Response(_mjpeg_generator(slot),
                     mimetype="multipart/x-mixed-replace; boundary=frame")
 
 
@@ -346,8 +356,82 @@ def _startup():
         ).start()
 
 
+def _run_supervisor():
+    """Supervises the furnace application process.
+    If the worker process crashes (e.g. Segmentation fault / signal 11 / exit code 139 / unhandled error),
+    this supervisor catches the crash, logs it, and immediately auto-restarts the application with python3 app.py.
+    A clean exit (Ctrl+C, SIGTERM, or exit code 0) terminates normally without restarting.
+    """
+    import subprocess
+    import sys
+    import time
+
+    env = os.environ.copy()
+    env["FURNACE_SUPERVISOR_CHILD"] = "1"
+
+    cmd = [sys.executable] + sys.argv
+    logger.info("Furnace Auto-Restart Supervisor active. Monitoring process: %s", " ".join(cmd))
+
+    consecutive_fast_crashes = 0
+    while True:
+        start_time = time.monotonic()
+        try:
+            p = subprocess.Popen(cmd, env=env)
+            exit_code = p.wait()
+        except KeyboardInterrupt:
+            logger.info("Supervisor received KeyboardInterrupt (Ctrl+C). Terminating application...")
+            try:
+                p.terminate()
+                p.wait(timeout=5)
+            except Exception:
+                p.kill()
+            break
+
+        elapsed = time.monotonic() - start_time
+
+        # Normal clean exit
+        if exit_code == 0:
+            logger.info("Furnace application exited cleanly (code 0). Exiting supervisor.")
+            sys.exit(0)
+
+        # Detect Segfault (POSIX signal -11 or shell exit code 139 = 128 + 11)
+        is_segfault = (exit_code == -11 or exit_code == 139)
+        crash_desc = "Segmentation fault (core dumped)" if is_segfault else f"exit code {exit_code}"
+
+        logger.error(
+            "====================================================================\n"
+            "[CRITICAL] Furnace application died unexpectedly with %s after %.1fs!\n"
+            "Auto-restarting application by '%s'...\n"
+            "====================================================================",
+            crash_desc, elapsed, " ".join(cmd),
+        )
+
+        if elapsed < 2.0:
+            consecutive_fast_crashes += 1
+            delay = min(5.0, 1.0 * consecutive_fast_crashes)
+            time.sleep(delay)
+        else:
+            consecutive_fast_crashes = 0
+            time.sleep(1.0)
+
+
 if __name__ == "__main__":
-    _startup()
-    logger.info("Starting Flask on %s:%s", config.FLASK_HOST, config.FLASK_PORT)
-    app.run(host=config.FLASK_HOST, port=config.FLASK_PORT, debug=config.FLASK_DEBUG,
-            threaded=True, use_reloader=False)
+    import sys
+
+    # If already running as child worker, or auto-restart is explicitly disabled via env/flag
+    if (
+        os.environ.get("FURNACE_SUPERVISOR_CHILD") == "1"
+        or os.environ.get("FURNACE_NO_SUPERVISOR") == "1"
+        or "--no-supervisor" in sys.argv
+    ):
+        _startup()
+        logger.info("Starting Flask on %s:%s", config.FLASK_HOST, config.FLASK_PORT)
+        app.run(
+            host=config.FLASK_HOST,
+            port=config.FLASK_PORT,
+            debug=config.FLASK_DEBUG,
+            threaded=True,
+            use_reloader=False,
+        )
+    else:
+        _run_supervisor()

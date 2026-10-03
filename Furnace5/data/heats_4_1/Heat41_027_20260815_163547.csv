@@ -1,4 +1,0 @@
-event,start_time,end_time,duration_minutes,tilt_number,note
-scrap_charging_unknown,,,,,
-sponge_charging,2026-08-15T16:35:47.460109,2026-08-15T16:35:47.460109,0.0,,"tilt held past 1.9 min, treated as tapping"
-tapping,2026-08-15T16:35:47.460109,2026-08-15T16:42:46.989657,6.99,,furnace returned to normal

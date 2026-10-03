@@ -1,0 +1,8 @@
+.agent/
+.agents/
+.gemini/
+.gsd/
+__pycache__/
+*.pyc
+*.log
+.env

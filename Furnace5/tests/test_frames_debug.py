@@ -135,9 +135,10 @@ class TestFramesDebug(unittest.TestCase):
             json.dump(meta2, f)
 
         client = app.test_client()
+        slug = list(config.FURNACE_SLOTS.keys())[0]
 
         # 1. Test /api/frames/heats
-        res = client.get("/furnace/5-1/api/frames/heats")
+        res = client.get(f"/furnace/{slug}/api/frames/heats")
         self.assertEqual(res.status_code, 200)
         heats_data = res.get_json()
         self.assertTrue(len(heats_data) >= 2)
@@ -146,7 +147,7 @@ class TestFramesDebug(unittest.TestCase):
         self.assertIn(heat2, heat_ids)
 
         # 2. Test /api/frames querying specific past heat
-        res_past = client.get(f"/furnace/5-1/api/frames?heat_id={heat1}")
+        res_past = client.get(f"/furnace/{slug}/api/frames?heat_id={heat1}")
         self.assertEqual(res_past.status_code, 200)
         frames_past = res_past.get_json()
         self.assertEqual(len(frames_past), 1)
@@ -157,7 +158,7 @@ class TestFramesDebug(unittest.TestCase):
         self.assertTrue(frames_past[0]["url_annotated"].endswith("_annotated.jpg"))
 
         # 3. Test /api/frames with heat_id=all
-        res_all = client.get("/furnace/5-1/api/frames?heat_id=all")
+        res_all = client.get(f"/furnace/{slug}/api/frames?heat_id=all")
         self.assertEqual(res_all.status_code, 200)
         frames_all = res_all.get_json()
         self.assertGreaterEqual(len(frames_all), 2)

@@ -1,4 +1,0 @@
-event,start_time,end_time,duration_minutes,tilt_number,note
-scrap_charging,2026-09-22T18:33:38.543345,2026-09-22T18:37:29.562897,3.85,,
-sponge_charging,2026-09-22T18:37:29.562897,2026-09-22T18:45:02.533708,7.55,,furnace_bottom_visiblecompletely (24) followed by laddle_moving_withmeltiron (25)
-tapping,2026-09-22T18:45:02.533708,2026-09-22T20:21:59.059395,96.94,,furnace had already returned to normal; tapping confirmed by visual evidence (24 then 25)

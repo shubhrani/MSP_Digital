@@ -12,8 +12,8 @@
 --
 -- Note on furnaces: Heats and HeatEvents are shared tables across every
 -- furnace that points at this database - each row carries a FurnaceId
--- ('5/2', '5/1', ...). Every query below can be scoped to one furnace by
--- adding "WHERE FurnaceId = '5/1'" (query 1 shows the pattern); drop that
+-- ('4/2', '4/1', ...). Every query below can be scoped to one furnace by
+-- adding "WHERE FurnaceId = '4/2'" (query 1 shows the pattern); drop that
 -- filter to see all furnaces together, as in query 9.
 -- =====================================================================
 
@@ -28,7 +28,7 @@ SELECT TOP 50
     ScrapMinutes, SpongeMinutes, TappingMinutes,
     TiltCount, TiltMinutes, UnaccountedMinutes
 FROM dbo.vw_HeatAnalysis
-WHERE FurnaceId = '5/1'   -- <- change this, or drop the WHERE for all furnaces
+WHERE FurnaceId = '4/2'   -- <- change this, or drop the WHERE for all furnaces
 ORDER BY StartTime DESC;
 GO
 
@@ -106,7 +106,7 @@ GO
 -- ---------------------------------------------------------------------
 SELECT EventName, FurnaceId, StartTime, EndTime, DurationMinutes, TiltNumber, Note
 FROM dbo.HeatEvents
-WHERE HeatId = 'Heat51_001_20260929_101500'   -- <- change this
+WHERE HeatId = 'Heat_001_20260811_080000'   -- <- change this
 ORDER BY EventId;
 GO
 

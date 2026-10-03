@@ -1,5 +1,0 @@
-event,start_time,end_time,duration_minutes,tilt_number,note
-scrap_charging,2026-09-23T12:13:32.502879,2026-09-23T12:13:53.264608,0.35,,
-slag_removal,2026-09-23T13:45:02.558193,2026-09-23T13:45:02.558193,0.0,,magnet moving slag
-sponge_charging,2026-09-23T12:13:53.264608,2026-09-23T12:43:06.701594,29.22,,furnace_bottom_visiblecompletely (24) followed by laddle_moving_withmeltiron (25)
-tapping,2026-09-23T12:43:06.701594,2026-09-23T13:43:46.566532,60.66,,furnace had already returned to normal; tapping confirmed by visual evidence (24 then 25)

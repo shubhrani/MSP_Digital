@@ -2,9 +2,10 @@
 Dynamic furnace slot manager.
 
 Owns the three physical StreamSources and the two logical FurnaceSlots
-(5/1 and 5/2). At startup it probes every stream for class 28
-(furnace_operation_undermaintenance) and treats the first one that shows
-it as the current maintenance stream; the other two back the two slots,
+(4/1 and 4/2). At startup it probes every stream for maintenance classes
+(such as furnace_operation_undermaintenance, coil_position_placednearfurnace,
+furnace_operation_preheating, furma_position_placednearfurnace) and treats
+the first one that shows it as the current maintenance stream; the other two back the two slots,
 in the order they appear in config.STREAMS.
 
 PYRO belongs to the logical FurnaceSlot, not the physical stream.
@@ -28,14 +29,19 @@ import cv2
 import config
 from camera_worker import (
     CameraWorker,
+    MAINTENANCE_DIRECT_CLASS_IDS,
     MAINTENANCE_TRACKED_CLASS_IDS,
     maintenance_reason,
 )
 from debounce import ClassDebouncer
 from state_machine import (
     HeatStateMachine,
+    CLS_COIL_POSITION_PLACEDNEARFURNACE,      # 0
+    CLS_FURNACE_OPERATION_PREHEATING,         # 7
+    CLS_FURNACE_OPERATION_UNDERMAINTENANCE,   # 28
+    CLS_FURMA_POSITION_PLACEDNEARFURNACE,     # 39
+    CLS_FURNACE_OPERATION_FURMAREPLACED,      # 31
     CLS_FURNACE_ACTIVEFIRE,
-    CLS_FURNACE_OPERATION_UNDERMAINTENANCE,
     CLS_FURNACE_POSITION_UP,                  # 34
     CLS_SPONGE_FEEDER_ENGAGED,                # 4
     CLS_SPONGE_FEEDER_ON_FURNACE,             # 15
@@ -189,18 +195,22 @@ class FurnaceSlot:
             pass
 
     def _handle_maintenance_detected(self, reason):
-        if (
-            self._swap_in_progress
-            or self._on_maintenance_detected is None
-        ):
+        if (self._swap_in_progress or self._on_maintenance_detected is None):
             return
 
         self._swap_in_progress = True
 
         try:
             self._on_maintenance_detected(self, reason)
-        finally:
-            pass
+        except Exception:
+            # Never leave the flag set if the swap could not even start -
+            # otherwise this slot would silently stop reacting to
+            # maintenance for the rest of the process lifetime.
+            self._swap_in_progress = False
+            logger.exception(
+                "Maintenance handler failed for slot %s - releasing swap flag",
+                self.slug,
+            )
 
     def swap_done(self):
         self._swap_in_progress = False
@@ -224,6 +234,7 @@ class FurnaceManager:
         self._reeval_thread = None
         self._poll_stop = threading.Event()
         self._poll_thread = None
+        self._last_cold_watch_mono = 0.0
 
     # ----------------------------------------------------------------
     # Startup
@@ -235,56 +246,20 @@ class FurnaceManager:
             slot.start_monitor()
 
         maintenance = self._probe_for_maintenance()
-        max_maintenance = max(0, len(self.streams) - len(self.slots))
-
-        # If more streams show maintenance than available spare slots (e.g. 2 streams
-        # flagged maintenance when we have 3 streams and need 2 active slots):
-        # We MUST NOT designate all of them as maintenance and leave a slot unassigned.
-        # Direct maintenance classes (28, 31, 0, 39) take precedence over indirect fan heuristics.
-        if len(maintenance) > max_maintenance:
-            def _maint_priority(s):
-                reason = getattr(s, "_probe_maintenance_reason", "") or ""
-                # Priority 0: confirmed direct maintenance class (e.g. 28, 31)
-                is_direct = any(f"class {cid}" in reason for cid in [28, 31, 0, 39])
-                return (0 if is_direct else 1, s.stream_id)
-
-            sorted_maint = sorted(maintenance, key=_maint_priority)
-            actual_maintenance = sorted_maint[:max_maintenance]
-            logger.warning(
-                "Multiple streams (%s) showed maintenance, but only %d spare available. "
-                "Designating %s as maintenance stream; remaining streams assigned to slots.",
-                [s.stream_id for s in maintenance],
-                max_maintenance,
-                [s.stream_id for s in actual_maintenance],
-            )
-            maintenance = actual_maintenance
-
         maintenance_ids = {s.stream_id for s in maintenance}
 
         for s in self.streams:
             if s.stream_id in maintenance_ids:
                 s.mark(
                     "maintenance",
-                    getattr(s, "_probe_maintenance_reason", "")
-                    or "maintenance condition confirmed during startup probe",
+                    "maintenance condition confirmed during startup probe",
                 )
 
         available = [s for s in self.streams if s.stream_id not in maintenance_ids]
-
-        # Critical invariant: every logical slot MUST be assigned a stream.
-        # If available streams are fewer than needed slots (e.g. due to connection outages),
-        # backfill from remaining streams so no furnace slot is left without video/monitoring.
-        order = list(config.FURNACE_SLOTS.keys())          # ["5-1", "5-2"] — no more hardcoded names
-        if len(available) < len(order):
-            for s in self.streams:
-                if s not in available:
-                    available.append(s)
-                if len(available) >= len(order):
-                    break
-
         logger.info("Startup probe done. maintenance=%s available=%s",
                     list(maintenance_ids), [s.stream_id for s in available])
 
+        order = list(self.slots.keys())
         for i, slug in enumerate(order):
             if i < len(available) and slug in self.slots:
                 self.slots[slug].attach_to_stream(available[i])
@@ -314,13 +289,12 @@ class FurnaceManager:
     # ----------------------------------------------------------------
     def _watchdog_loop(self):
         """Every SLOT_POLL_SECONDS, check every assigned slot for a stale
-        last_activefire_at. The state machine owns this check while a heat
-        is live (it wipes the heat and calls us back). This loop covers
-        the OTHER case: the slot is idle, the furnace behind it has gone
-        cold, and the plant wants to bring the spare online."""
+        last_activefire_at. Also periodically probe spare streams to see if
+        one has warmed up enough to replace a cold assigned stream."""
         while not self._poll_stop.wait(config.SLOT_POLL_SECONDS):
             try:
                 self._watchdog_tick()
+                self._check_cold_streams_for_hot_spares()
             except Exception:
                 logger.exception("Active-fire watchdog tick failed")
 
@@ -362,6 +336,72 @@ class FurnaceManager:
                 self._trigger_reevaluation(slot)
                 return
 
+    def _check_cold_streams_for_hot_spares(self):
+        """If a slot is holding a cold stream (no active fire for
+        COLD_STREAM_MIN_COLD_MINUTES) but an unassigned spare now shows
+        active fire, kick off a re-evaluation so the hot stream can be
+        swapped in.
+
+        Only *unassigned* spares are probed — probing a stream that is
+        already being read by a slot would open a second RTSP connection
+        to the same camera.
+        """
+        now = datetime.datetime.now()
+
+        cold_slots = []
+        for slot in self.slots.values():
+            sm = slot.state_machine
+            stream = slot.current_stream
+            if sm is None or stream is None:
+                continue
+            if stream.status == "maintenance":
+                continue
+            last = sm.last_activefire_at
+            if last is None:
+                continue
+            cold_minutes = (now - last).total_seconds() / 60.0
+            if cold_minutes >= config.COLD_STREAM_MIN_COLD_MINUTES:
+                cold_slots.append(slot)
+
+        if not cold_slots:
+            return
+
+        spares = [
+            s for s in self.streams
+            if s.assigned_slot is None and s.status != "maintenance"
+        ]
+        if not spares:
+            return
+
+        # Throttle. Probing a spare briefly opens an RTSP connection, so
+        # keep this clearly larger than PROBE_ACTIVEFIRE_SECONDS.
+        now_mono = time.monotonic()
+        if now_mono - getattr(self, "_last_cold_watch_mono", 0.0) < config.COLD_STREAM_WATCH_SECONDS:
+            return
+        self._last_cold_watch_mono = now_mono
+
+        for spare in spares:
+            try:
+                if self._probe_stream(
+                    spare.rtsp_url,
+                    config.PROBE_ACTIVEFIRE_SECONDS,
+                    target_class=CLS_FURNACE_ACTIVEFIRE,
+                ):
+                    logger.info(
+                        "Cold slot %s (stream %s) has had no active fire for "
+                        "%.1f min, but spare %s now shows active fire — "
+                        "re-evaluating to swap it in.",
+                        cold_slots[0].slug,
+                        cold_slots[0].current_stream.stream_id,
+                        (now - cold_slots[0].state_machine.last_activefire_at)
+                            .total_seconds() / 60.0,
+                        spare.stream_id,
+                    )
+                    self._trigger_reevaluation(cold_slots[0])
+                    return
+            except Exception:
+                logger.exception("Cold-stream probe failed for %s", spare.stream_id)
+
     def _on_slot_lost_activefire(self, slot):
         """Called by a slot's state machine when it wipes a heat for lack
         of active fire."""
@@ -394,6 +434,12 @@ class FurnaceManager:
 
     def _trigger_reevaluation(self, slot=None, excluded_stream_id=None):
         if self._reeval_thread and self._reeval_thread.is_alive():
+            # A re-evaluation is already in flight; it will look at every
+            # stream anyway. Release the caller's swap flag so the slot can
+            # re-trigger on the next watchdog tick if it is still in
+            # maintenance (instead of being permanently stuck).
+            if slot is not None and slot._swap_in_progress:
+                slot.swap_done()
             return
 
         # The triggering slot is only used for the thread name / logging in
@@ -428,129 +474,180 @@ class FurnaceManager:
           {2,3} with 1 back -> 1->4/1, 2->4/2
           etc.
         """
-        with self._lock:
-            logger.info("Re-evaluating streams (triggered by %s)", failing_slot.slug)
-
-            # ---- Parallel probe for active fire -----------------------------
-            results = {}
-            results_lock = threading.Lock()
-
-            def probe_one(stream):
-                # A stream already known to be under maintenance is never a
-                # candidate, even if a stray class-3 frame comes through.
-                if stream.status == "maintenance":
-                    with results_lock:
-                        results[stream.stream_id] = False
-                    return
-                ok = self._probe_stream(
-                    stream.rtsp_url,
-                    config.PROBE_ACTIVEFIRE_SECONDS,
-                    target_class=CLS_FURNACE_ACTIVEFIRE,
-                )
-                with results_lock:
-                    results[stream.stream_id] = ok
-
-            threads = [
-                threading.Thread(target=probe_one, args=(s,), daemon=True)
-                for s in self.streams
-            ]
-            for t in threads:
-                t.start()
-            for t in threads:
-                t.join(timeout=config.PROBE_ACTIVEFIRE_SECONDS + 10)
-
-            # ---- Pick the two highest-priority available streams -----------
-            # self.streams is already in config.STREAMS order = priority order.
-            available = [
-                s for s in self.streams
-                if results.get(s.stream_id) and s.status != "maintenance"
-            ]
-
-            logger.info(
-                "Probe results: %s. Priority-ordered available: %s",
-                {s.stream_id: bool(results.get(s.stream_id)) for s in self.streams},
-                [s.stream_id for s in available],
-            )
-
-            slot_order = list(config.FURNACE_SLOTS.keys())   # 5/1 takes available[0], 5/2 takes available[1]
-
-            # Critical: if fewer streams showed active fire than needed slots
-            # (e.g. one furnace is firing while the other is charging scrap / tapping / idle),
-            # backfill from non-maintenance streams first, then remaining streams,
-            # so NO slot is ever detached and left without video or monitoring.
-            if len(available) < len(slot_order):
-                for s in self.streams:
-                    if s not in available and s.status != "maintenance":
-                        available.append(s)
-                    if len(available) >= len(slot_order):
-                        break
-
-            if len(available) < len(slot_order):
-                for s in self.streams:
-                    if s not in available:
-                        available.append(s)
-                    if len(available) >= len(slot_order):
-                        break
-
-            if len(available) < len(slot_order):
-                logger.warning(
-                    "Only %d stream(s) available (need %d to fully staff %s). "
-                    "The lowest-priority slot(s) will be left unassigned.",
-                    len(available), len(slot_order), "+".join(slot_order),
+        try:
+            with self._lock:
+                logger.info(
+                    "Re-evaluating streams (triggered by %s, excluded=%s)",
+                    failing_slot.slug,
+                    excluded_stream_id,
                 )
 
-            assignment = {}
-            for i, slug in enumerate(slot_order):
-                if i < len(available):
-                    assignment[slug] = available[i]
+                # ---- Parallel probe for active fire -----------------------------
+                results = {}
+                results_lock = threading.Lock()
 
-            # ---- Apply -----------------------------------------------------
-            # Release any stream being vacated before attaching, so a stream
-            # shifting between slots (e.g. 4/2 -> 4/1) isn't accidentally
-            # cleared when the second slot releases its old binding.
-            for slug in slot_order:
-                slot = self.slots[slug]
-                new_stream = assignment.get(slug)
-                if new_stream is slot.current_stream:
-                    continue
-                if slot.current_stream is not None:
-                    old = slot.current_stream
-                    old.assigned_slot = None
-                    if old.status != "maintenance":
-                        old.mark("spare", f"released by {slug} during re-evaluation")
-                    slot.detach()
+                def probe_one(stream):
+                    # A stream already known to be under maintenance or excluded is never a candidate.
+                    if stream.status == "maintenance" or stream.stream_id == excluded_stream_id:
+                        with results_lock:
+                            results[stream.stream_id] = False
+                        return
 
-            for slug in slot_order:
-                slot = self.slots[slug]
-                new_stream = assignment.get(slug)
-                if new_stream is slot.current_stream:
-                    continue
-                if new_stream is not None:
-                    slot.attach_to_stream(new_stream)
-                    logger.info(
-                        "Re-evaluation bound slot %s -> %s (PYRO %s)",
-                        slug, new_stream.stream_id, slot.pyro_field,
+                    # If this stream is already assigned to a healthy running slot (and not failing),
+                    # inspect the existing live worker instead of opening a conflicting RTSP stream.
+                    active_slot = None
+                    for sl in self.slots.values():
+                        if sl.current_stream is stream and sl is not failing_slot:
+                            active_slot = sl
+                            break
+
+                    if active_slot is not None and active_slot.camera_worker is not None:
+                        cw = active_slot.camera_worker
+                        try:
+                            is_active = (
+                                cw.is_connected()
+                                and cw.debouncer.is_confirmed(CLS_FURNACE_ACTIVEFIRE)
+                            )
+                        except Exception:
+                            is_active = False
+                        with results_lock:
+                            results[stream.stream_id] = is_active
+                        logger.info(
+                            "Probe (reused live worker): %s -> %s",
+                            stream.stream_id, "fire" if is_active else "no fire",
+                        )
+                        return
+
+                    ok = self._probe_stream(
+                        stream.rtsp_url,
+                        config.ALLOCATION_ACTIVEFIRE_PROBE_SECONDS,      # <- 30s
+                        target_class=CLS_FURNACE_ACTIVEFIRE,
+                        label=f"{stream.stream_id} ({stream.name})",
                     )
+                    with results_lock:
+                        results[stream.stream_id] = ok
+
+                threads = [
+                    threading.Thread(target=probe_one, args=(s,), daemon=True)
+                    for s in self.streams
+                ]
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join(timeout=config.ALLOCATION_ACTIVEFIRE_PROBE_SECONDS + 15)
+
+                # Candidate streams are those not in maintenance and not excluded
+                candidate_streams = [
+                    s for s in self.streams
+                    if s.status != "maintenance" and s.stream_id != excluded_stream_id
+                ]
+
+                # --- Split by active-fire presence (the primary signal) ---------------
+                fire_streams = [s for s in candidate_streams if results.get(s.stream_id)]
+                cold_streams = [s for s in candidate_streams if not results.get(s.stream_id)]
+
+                logger.info(
+                    "Probe results: fire=%s cold=%s",
+                    [s.stream_id for s in fire_streams],
+                    [s.stream_id for s in cold_streams],
+                )
+
+                slot_order = list(self.slots.keys())    # 5-1 first, then 5-2
+                assignment = {}
+
+                if len(fire_streams) >= 2:
+                    # 2 (or 3) cameras see active fire: the two highest-priority
+                    # fire streams get the two slots. Priority = config.STREAMS order.
+                    # (Same behaviour as before — this is the "happy path".)
+                    for i, slug in enumerate(slot_order):
+                        if i < len(fire_streams):
+                            assignment[slug] = fire_streams[i]
+                        elif (i - len(fire_streams)) < len(cold_streams):
+                            assignment[slug] = cold_streams[i - len(fire_streams)]
+
+                elif len(fire_streams) == 1:
+                    # Exactly one camera sees active fire. Give that stream to the
+                    # "desired" slot (the failing slot if we know it, else slot
+                    # priority 1), and put the best cold stream on the other slot so
+                    # that slot is not left with a blank feed.
+                    #
+                    # The watchdog will keep probing the cold stream
+                    # (_check_cold_streams_for_hot_spares below); if it warms up, a
+                    # second re-evaluation swaps it in.
+                    fire_stream = fire_streams[0]
+
+                    if failing_slot is not None and failing_slot.slug in slot_order:
+                        desired_slug = failing_slot.slug
+                    else:
+                        desired_slug = slot_order[0]
+                    other_slug = next(s for s in slot_order if s != desired_slug)
+
+                    assignment[desired_slug] = fire_stream
+                    if cold_streams:
+                        assignment[other_slug] = cold_streams[0]
+
+                    logger.info(
+                        "Only 1 fire stream (%s). Assigning to slot %s; cold %s -> slot %s. "
+                        "Watchdog will swap if the cold stream becomes hot.",
+                        fire_stream.stream_id, desired_slug,
+                        cold_streams[0].stream_id if cold_streams else "none",
+                        other_slug,
+                    )
+
                 else:
-                    slot.detach()
-                    logger.warning("Slot %s left unassigned", slug)
+                    # No camera currently shows active fire. Fall back to priority
+                    # order over the cold streams so both slots are still staffed.
+                    for i, slug in enumerate(slot_order):
+                        if i < len(cold_streams):
+                            assignment[slug] = cold_streams[i]
 
-            # ---- Anything not assigned becomes spare ----------------------
-            assigned_ids = {s.stream_id for s in assignment.values()}
-            for s in self.streams:
-                if s.stream_id in assigned_ids:
-                    continue
-                if s.status == "maintenance":
-                    continue
-                if s.assigned_slot is not None:
-                    # Defensive: shouldn't happen after the release loop.
-                    s.assigned_slot = None
-                s.mark("spare", "unused after re-evaluation")
+                # ---- Apply -----------------------------------------------------
+                # Release any stream being vacated before attaching, so a stream
+                # shifting between slots (e.g. 4/2 -> 4/1) isn't accidentally
+                # cleared when the second slot releases its old binding.
+                for slug in slot_order:
+                    slot = self.slots[slug]
+                    new_stream = assignment.get(slug)
+                    if new_stream is slot.current_stream:
+                        continue
+                    if slot.current_stream is not None:
+                        old = slot.current_stream
+                        old.assigned_slot = None
+                        if old.status != "maintenance":
+                            old.mark("spare", f"released by {slug} during re-evaluation")
+                        slot.detach()
 
-            # Clear the swap flag on the slot that started this (kept for
-            # compatibility with the old state-machine callback).
-            if failing_slot._swap_in_progress:
-                failing_slot.swap_done()
+                for slug in slot_order:
+                    slot = self.slots[slug]
+                    new_stream = assignment.get(slug)
+                    if new_stream is slot.current_stream:
+                        continue
+                    if new_stream is not None:
+                        slot.attach_to_stream(new_stream)
+                        logger.info(
+                            "Re-evaluation bound slot %s -> %s (PYRO %s)",
+                            slug, new_stream.stream_id, slot.pyro_field,
+                        )
+                    else:
+                        slot.detach()
+                        logger.warning("Slot %s left unassigned", slug)
+
+                # ---- Anything not assigned becomes spare ----------------------
+                assigned_ids = {s.stream_id for s in assignment.values()}
+                for s in self.streams:
+                    if s.stream_id in assigned_ids:
+                        continue
+                    if s.status == "maintenance":
+                        continue
+                    if s.assigned_slot is not None:
+                        # Defensive: shouldn't happen after the release loop.
+                        s.assigned_slot = None
+                    s.mark("spare", "unused after re-evaluation")
+        finally:
+            # Guarantee swap flags are cleared on all slots so future swaps can trigger
+            for s in self.slots.values():
+                if s._swap_in_progress:
+                    s.swap_done()
 
     def _probe_for_maintenance(self):
         """Return every stream where maintenance is confirmed.
@@ -582,13 +679,9 @@ class FurnaceManager:
 
         hits = []
         for stream in self.streams:
-            res = results.get(stream.stream_id)
-            if res:
-                stream._probe_maintenance_reason = str(res) if isinstance(res, str) else "maintenance confirmed"
+            if results.get(stream.stream_id):
                 logger.warning(
-                    "Stream %s shows maintenance condition (%s)",
-                    stream.stream_id,
-                    stream._probe_maintenance_reason,
+                    "Stream %s shows maintenance condition", stream.stream_id,
                 )
                 hits.append(stream)
         return hits
@@ -607,26 +700,13 @@ class FurnaceManager:
         for attempt in range(1, retries + 1):
 
             cap = None
-
             try:
                 cap = cv2.VideoCapture(
                     rtsp_url,
                     cv2.CAP_FFMPEG,
-                    [
-                        cv2.CAP_PROP_OPEN_TIMEOUT_MSEC,
-                        5000,
-
-                        cv2.CAP_PROP_READ_TIMEOUT_MSEC,
-                        3000,
-                    ],
                 )
-
-            except (TypeError, cv2.error):
-
-                cap = cv2.VideoCapture(
-                    rtsp_url,
-                    cv2.CAP_FFMPEG,
-                )
+            except Exception:
+                cap = None
 
             if cap is not None and cap.isOpened():
 
@@ -665,26 +745,28 @@ class FurnaceManager:
         duration_seconds,
         target_class=CLS_FURNACE_OPERATION_UNDERMAINTENANCE,
         maintenance_mode=False,
+        label=None,
     ):
+        """Probe one stream for a target class.
+
+        label: optional short string used in the countdown log so an operator
+        watching the console can tell which probe is which. When omitted the
+        RTSP URL is used.
+        """
         from detector import FurnaceDetector
+
+        label = label or rtsp_url
 
         try:
             detector = FurnaceDetector()
         except Exception:
-            logger.exception(
-                "Could not load model during stream probe"
-            )
+            logger.exception("Could not load model during stream probe")
             return False
 
-        cap = self._open_probe_capture(
-            rtsp_url,
-            retries=3,
-        )
-
+        cap = self._open_probe_capture(rtsp_url, retries=3)
         if cap is None:
             logger.warning(
-                "Probe could not open %s after reconnect attempts",
-                rtsp_url,
+                "Probe could not open %s after reconnect attempts", rtsp_url,
             )
             return False
 
@@ -700,11 +782,16 @@ class FurnaceManager:
         )
 
         deadline = time.monotonic() + duration_seconds
+        next_tick = time.monotonic() + config.ALLOCATION_PROBE_TICK_SECONDS
+
+        logger.info(
+            "Probe start: %s (target=%s, window=%.0fs)",
+            label, target_class, duration_seconds,
+        )
 
         try:
             while time.monotonic() < deadline:
                 ret, frame = cap.read()
-
                 if not ret or frame is None:
                     break
 
@@ -714,27 +801,40 @@ class FurnaceManager:
                     continue
 
                 confirmed, _ = debouncer.update(
-                    {
-                        d["class_id"]
-                        for d in detections
-                    }
+                    {d["class_id"] for d in detections}
                 )
 
                 if maintenance_mode:
-                    reason = maintenance_reason(
-                        detections,
-                        debouncer,
-                        confirmed,
-                    )
-                    if reason is not None:
-                        return reason
-
+                    if maintenance_reason(detections, debouncer, confirmed) is not None:
+                        remaining = max(0, deadline - time.monotonic())
+                        logger.info(
+                            "Probe hit: %s (maintenance) after %.1fs, %.1fs left",
+                            label, duration_seconds - remaining, remaining,
+                        )
+                        return True
                 elif target_class in confirmed:
+                    remaining = max(0, deadline - time.monotonic())
+                    logger.info(
+                        "Probe hit: %s (class %d) after %.1fs, %.1fs left",
+                        label, target_class, duration_seconds - remaining, remaining,
+                    )
                     return True
+
+                # Countdown tick — purely informational.
+                now = time.monotonic()
+                if now >= next_tick:
+                    remaining = max(0, deadline - now)
+                    logger.info(
+                        "Probe … %s: %.0fs remaining (class %d not yet confirmed)",
+                        label, remaining, target_class,
+                    )
+                    next_tick = now + config.ALLOCATION_PROBE_TICK_SECONDS
 
         finally:
             cap.release()
 
+        logger.info("Probe miss: %s (no class %d within %.0fs)",
+                    label, target_class, duration_seconds)
         return False
 
     def _probe_stream_for_process_resume(self, stream, duration_seconds):

@@ -31,6 +31,7 @@ from state_machine import (
     CLS_NEGATIVE_FAN,
     CLS_FURNACE_OPERATION_UNDERMAINTENANCE,
     CLS_COIL_POSITION_PLACEDNEARFURNACE,
+    CLS_FURNACE_OPERATION_PREHEATING,
     CLS_FURMA_POSITION_PLACEDNEARFURNACE,
     CLS_FURNACE_OPERATION_FURMAREPLACED,
 )
@@ -48,6 +49,7 @@ _PLACEHOLDER_TEXT = "Waiting for camera..."
 MAINTENANCE_DIRECT_CLASS_IDS = {
     CLS_FURNACE_OPERATION_UNDERMAINTENANCE,  # 28
     CLS_COIL_POSITION_PLACEDNEARFURNACE,     # 0
+    CLS_FURNACE_OPERATION_PREHEATING,        # 7
     CLS_FURMA_POSITION_PLACEDNEARFURNACE,    # 39
     CLS_FURNACE_OPERATION_FURMAREPLACED,     # 31
 }
@@ -134,6 +136,7 @@ def maintenance_reason(detections, debouncer, newly_confirmed):
       1. Any direct maintenance class is confirmed:
            28 - furnace_operation_undermaintenance
             0 - coil_position_placednearfurnace
+            7 - furnace_operation_preheating
            39 - furma_position_placednearfurnace
            31 - furnace_operation_furmareplaced
 
@@ -215,9 +218,16 @@ class CameraWorker(threading.Thread):
         self._frame_seq = 0
         self._connected = False
         self._running = True
+        self._stop_event = threading.Event()
+        self.cap = None
         self._frame_count = 0
         self._last_detections = []
         self._consecutive_read_failures = 0
+
+        # Pre-seed with a placeholder frame so MJPEG viewers have an immediate valid image
+        # while the camera connects and model loads, preventing blank feeds during swaps.
+        self._set_placeholder_frame(f"Connecting to {self.stream_id or 'camera'}...")
+
 
     # -----------------------------------------------------------------
     def _open_rtsp_capture(self):
@@ -232,37 +242,13 @@ class CameraWorker(threading.Thread):
         """
 
         cap = None
-
         try:
-            # Newer OpenCV builds support open/read timeout parameters directly
-            # in the constructor. This is preferable because OPEN_TIMEOUT must
-            # apply while the connection is actually being established.
-            cap = cv2.VideoCapture(
-                self.rtsp_url,
-                cv2.CAP_FFMPEG,
-                [
-                    cv2.CAP_PROP_OPEN_TIMEOUT_MSEC,
-                    10000,
-
-                    cv2.CAP_PROP_READ_TIMEOUT_MSEC,
-                    5000,
-                ],
-            )
-
-        except (TypeError, cv2.error):
-            # Compatibility fallback for older OpenCV versions.
             cap = cv2.VideoCapture(
                 self.rtsp_url,
                 cv2.CAP_FFMPEG,
             )
-
-            try:
-                cap.set(
-                    cv2.CAP_PROP_READ_TIMEOUT_MSEC,
-                    5000,
-                )
-            except Exception:
-                pass
+        except Exception:
+            cap = None
 
         if cap is None or not cap.isOpened():
             if cap is not None:
@@ -277,6 +263,7 @@ class CameraWorker(threading.Thread):
             pass
 
         self._consecutive_read_failures = 0
+        self.cap = cap
         return cap
 
     def run(self):
@@ -286,18 +273,18 @@ class CameraWorker(threading.Thread):
             logger.exception("Could not load model, video feed will show raw stream only")
             self.detector_error = str(exc)
 
-        cap = None
-        while self._running:
-            if cap is None or not cap.isOpened():
+        self.cap = None
+        while self._running and not self._stop_event.is_set():
+            if self.cap is None or not self.cap.isOpened():
                 logger.info(
                     "Connecting to RTSP stream %s: %s",
                     self.stream_id,
                     self.rtsp_url,
                 )
 
-                cap = self._open_rtsp_capture()
+                self.cap = self._open_rtsp_capture()
 
-                if cap is None:
+                if self.cap is None:
                     self._connected = False
 
                     self._set_placeholder_frame(
@@ -314,7 +301,7 @@ class CameraWorker(threading.Thread):
                         config.RECONNECT_DELAY_SECONDS,
                     )
 
-                    time.sleep(
+                    self._stop_event.wait(
                         config.RECONNECT_DELAY_SECONDS
                     )
 
@@ -335,13 +322,13 @@ class CameraWorker(threading.Thread):
             # so we always work on the freshest one. grab() is cheap (no decode);
             # retrieve() decodes only the last grabbed frame.
             # ---------------------------------------------------------------
-            if cap is not None and cap.isOpened():
+            if self.cap is not None and self.cap.isOpened():
                 # Discard up to 4 stale frames; if the camera is idle, this loop
                 # exits immediately because grab() returns False.
                 for _ in range(4):
-                    if not cap.grab():
+                    if not self.cap.grab():
                         break
-                ret, frame = cap.retrieve()
+                ret, frame = self.cap.retrieve()
             else:
                 ret, frame = False, None
 
@@ -352,7 +339,7 @@ class CameraWorker(threading.Thread):
                 # reconnect after several in a row, so transient glitches don't
                 # cause a connect/disconnect loop.
                 if self._consecutive_read_failures < 10:
-                    time.sleep(0.05)
+                    self._stop_event.wait(0.05)
                     continue
 
                 logger.warning(
@@ -364,12 +351,13 @@ class CameraWorker(threading.Thread):
                 if self.state_machine is not None:
                     self.state_machine.note_camera_state(False)
                 try:
-                    cap.release()
+                    if self.cap is not None:
+                        self.cap.release()
                 except Exception:
                     pass
-                cap = None
+                self.cap = None
                 self._set_placeholder_frame("Camera interrupted - reconnecting...")
-                time.sleep(config.RECONNECT_DELAY_SECONDS)
+                self._stop_event.wait(config.RECONNECT_DELAY_SECONDS)
                 continue
 
             # Read succeeded -> reset the failure counter.
@@ -442,8 +430,12 @@ class CameraWorker(threading.Thread):
             if ok:
                 self._publish_frame(jpeg.tobytes())
 
-        if cap is not None:
-            cap.release()
+        if self.cap is not None:
+            try:
+                self.cap.release()
+            except Exception:
+                pass
+            self.cap = None
         # Wake up any generators still waiting so they can notice
         # self._running is now False and exit cleanly.
         with self._frame_condition:
@@ -646,7 +638,35 @@ class CameraWorker(threading.Thread):
     def is_connected(self):
         return self._connected
 
-    def stop(self):
+    def stop(self, timeout: float = 5.0):
+        """Signal the run loop to exit AND wait for it to finish.
+
+        Joining is important for stream swaps: the caller must be sure the
+        old RTSP connection has been released (and the current YOLO predict
+        call has completed) before the replacement worker opens its own
+        connection to the same camera. Without this, a swap could leave two
+        CameraWorkers alive for a few frames, both writing to the recorder.
+        """
         self._running = False
+        self._stop_event.set()
         with self._frame_condition:
             self._frame_condition.notify_all()
+
+        try:
+            # Defensive: if stop() is somehow called from inside our own run()
+            # thread, join() raises RuntimeError. Swallow it - the _running
+            # check already breaks the loop.
+            self.join(timeout=timeout)
+        except RuntimeError:
+            pass
+
+        # Clean up any capture left over if run() loop hasn't already released it.
+        # Joining first guarantees cap.read() is not concurrently executing in
+        # another thread, which avoids OpenCV/FFmpeg C-level segmentation faults.
+        c = self.cap
+        if c is not None:
+            try:
+                c.release()
+            except Exception:
+                pass
+            self.cap = None

@@ -96,8 +96,9 @@ class TestFurnaceManager(unittest.TestCase):
     @patch.object(FurnaceManager, "_probe_stream")
     def test_furnace_manager_startup_with_maintenance(self, mock_probe, mock_worker_cls):
         # Simulate stream-1 showing maintenance (class 28)
+        s1_url = config.STREAMS[0]["rtsp_url"]
         def fake_probe(rtsp_url, duration_seconds, *args, **kwargs):
-            return "10.50.40.160" in rtsp_url or "stream-1" in rtsp_url
+            return s1_url in rtsp_url or "stream-1" in rtsp_url
 
         mock_probe.side_effect = fake_probe
 
@@ -112,11 +113,12 @@ class TestFurnaceManager(unittest.TestCase):
         s2 = next(s for s in mgr.streams if s.stream_id == "stream-2")
         s3 = next(s for s in mgr.streams if s.stream_id == "stream-3")
 
+        slot1, slot2 = list(config.FURNACE_SLOTS.keys())[:2]
         self.assertEqual(s1.status, "maintenance")
         self.assertEqual(s2.status, "active")
-        self.assertEqual(s2.assigned_slot, "5-1")
+        self.assertEqual(s2.assigned_slot, slot1)
         self.assertEqual(s3.status, "active")
-        self.assertEqual(s3.assigned_slot, "5-2")
+        self.assertEqual(s3.assigned_slot, slot2)
 
         with patch.object(FurnaceSlot, "stop_monitor"):
             mgr.stop()
@@ -128,12 +130,17 @@ class TestFurnaceManager(unittest.TestCase):
         # Re-evaluation: stream-2 and stream-3 show active fire; stream-1 does not
         from state_machine import CLS_FURNACE_ACTIVEFIRE, CLS_FURNACE_OPERATION_UNDERMAINTENANCE
 
+        s2_url = config.STREAMS[1]["rtsp_url"]
+        s3_url = config.STREAMS[2]["rtsp_url"]
+        slot1, slot2 = list(config.FURNACE_SLOTS.keys())[:2]
+        expected_pyro1 = config.FURNACE_SLOTS[slot1]["pyro_field"]
+
         def fake_probe(rtsp_url, duration_seconds, target_class=CLS_FURNACE_OPERATION_UNDERMAINTENANCE, *args, **kwargs):
             if target_class == CLS_FURNACE_OPERATION_UNDERMAINTENANCE:
                 return False
             if target_class == CLS_FURNACE_ACTIVEFIRE:
-                # stream-2 (158) and stream-3 (159) show fire, stream-1 (160) is cold
-                return "10.50.40.158" in rtsp_url or "10.50.40.159" in rtsp_url
+                # stream-2 and stream-3 show fire, stream-1 is cold
+                return s2_url in rtsp_url or s3_url in rtsp_url
             return False
 
         mock_probe.side_effect = fake_probe
@@ -148,41 +155,41 @@ class TestFurnaceManager(unittest.TestCase):
         s2 = next(s for s in mgr.streams if s.stream_id == "stream-2")
         s3 = next(s for s in mgr.streams if s.stream_id == "stream-3")
 
-        # Initial assignment: 5-1 -> s1, 5-2 -> s2, s3 is spare
+        # Initial assignment: slot1 -> s1, slot2 -> s2, s3 is spare
         self.assertEqual(s1.status, "active")
-        self.assertEqual(s1.assigned_slot, "5-1")
+        self.assertEqual(s1.assigned_slot, slot1)
         self.assertEqual(s2.status, "active")
-        self.assertEqual(s2.assigned_slot, "5-2")
+        self.assertEqual(s2.assigned_slot, slot2)
         self.assertEqual(s3.status, "spare")
         self.assertIsNone(s3.assigned_slot)
 
-        slot_5_1 = mgr.get_slot("5-1")
-        slot_5_2 = mgr.get_slot("5-2")
-        initial_5_1_monitor = slot_5_1.temperature_monitor
-        self.assertEqual(slot_5_1.pyro_field, "PYRO5/1")
+        slot_obj_1 = mgr.get_slot(slot1)
+        slot_obj_2 = mgr.get_slot(slot2)
+        initial_1_monitor = slot_obj_1.temperature_monitor
+        self.assertEqual(slot_obj_1.pyro_field, expected_pyro1)
 
-        # Trigger active-fire loss on slot 5-1
-        slot_5_1._handle_activefire_loss()
+        # Trigger active-fire loss on slot 1
+        slot_obj_1._handle_activefire_loss()
 
         # Wait for re-evaluation thread
         if mgr._reeval_thread:
             mgr._reeval_thread.join(timeout=5.0)
 
-        # After re-evaluation under priority rule: s1 released to spare, s2 now active on 5-1, s3 on 5-2
+        # After re-evaluation under priority rule: s1 released to spare, s2 now active on slot1, s3 on slot2
         self.assertEqual(s1.status, "spare")
         self.assertIsNone(s1.assigned_slot)
         self.assertEqual(s2.status, "active")
-        self.assertEqual(s2.assigned_slot, "5-1")
-        self.assertEqual(slot_5_1.current_stream, s2)
+        self.assertEqual(s2.assigned_slot, slot1)
+        self.assertEqual(slot_obj_1.current_stream, s2)
 
-        # Critical invariant: PYRO monitor and pyro_field on 5-1 survive the swap
-        self.assertIs(slot_5_1.temperature_monitor, initial_5_1_monitor)
-        self.assertEqual(slot_5_1.pyro_field, "PYRO5/1")
-        self.assertIs(slot_5_1.state_machine.temperature_monitor, initial_5_1_monitor)
+        # Critical invariant: PYRO monitor and pyro_field on slot1 survive the swap
+        self.assertIs(slot_obj_1.temperature_monitor, initial_1_monitor)
+        self.assertEqual(slot_obj_1.pyro_field, expected_pyro1)
+        self.assertIs(slot_obj_1.state_machine.temperature_monitor, initial_1_monitor)
 
         self.assertEqual(s3.status, "active")
-        self.assertEqual(s3.assigned_slot, "5-2")
-        self.assertEqual(slot_5_2.current_stream, s3)
+        self.assertEqual(s3.assigned_slot, slot2)
+        self.assertEqual(slot_obj_2.current_stream, s3)
 
         # Snapshots
         snap = mgr.streams_snapshot()
@@ -202,18 +209,19 @@ class TestFurnaceManager(unittest.TestCase):
         with patch.object(FurnaceSlot, "start_monitor"):
             mgr.start()
 
-        slot_5_1 = mgr.get_slot("5-1")
-        self.assertEqual(slot_5_1.state_machine.state, "IDLE")
+        slot1 = list(config.FURNACE_SLOTS.keys())[0]
+        slot_obj_1 = mgr.get_slot(slot1)
+        self.assertEqual(slot_obj_1.state_machine.state, "IDLE")
 
         with patch.object(config, "ACTIVEFIRE_TIMEOUT_MINUTES", 5):
             # Set last_activefire_at to 6 minutes ago (> ACTIVEFIRE_TIMEOUT_MINUTES = 5)
-            slot_5_1.state_machine.last_activefire_at = (
+            slot_obj_1.state_machine.last_activefire_at = (
                 datetime.datetime.now() - datetime.timedelta(minutes=6)
             )
 
             with patch.object(mgr, "_trigger_reevaluation") as mock_trigger:
                 mgr._watchdog_tick()
-                mock_trigger.assert_called_once_with(slot_5_1)
+                mock_trigger.assert_called_once_with(slot_obj_1)
 
         with patch.object(FurnaceSlot, "stop_monitor"):
             mgr.stop()
@@ -238,6 +246,32 @@ class TestFurnaceManager(unittest.TestCase):
 
         # Empty newly_confirmed returns None
         self.assertIsNone(maintenance_reason([], debouncer_mock, []))
+
+    def test_all_specified_maintenance_classes_trigger_maintenance(self):
+        from camera_worker import (
+            maintenance_reason,
+            MAINTENANCE_DIRECT_CLASS_IDS,
+        )
+        from state_machine import (
+            CLS_COIL_POSITION_PLACEDNEARFURNACE,
+            CLS_FURNACE_OPERATION_PREHEATING,
+            CLS_FURNACE_OPERATION_UNDERMAINTENANCE,
+            CLS_FURMA_POSITION_PLACEDNEARFURNACE,
+        )
+
+        expected_classes = {
+            CLS_COIL_POSITION_PLACEDNEARFURNACE: 0,
+            CLS_FURNACE_OPERATION_PREHEATING: 7,
+            CLS_FURNACE_OPERATION_UNDERMAINTENANCE: 28,
+            CLS_FURMA_POSITION_PLACEDNEARFURNACE: 39,
+        }
+
+        debouncer_mock = MagicMock()
+        for cid, expected_val in expected_classes.items():
+            self.assertEqual(cid, expected_val)
+            self.assertIn(cid, MAINTENANCE_DIRECT_CLASS_IDS)
+            reason = maintenance_reason([], debouncer_mock, [cid])
+            self.assertEqual(reason, f"maintenance class {cid} confirmed")
 
     def test_check_maintenance_streams_for_resume_clears_flag(self):
         recorder = MagicMock()
@@ -291,16 +325,17 @@ class TestFurnaceManager(unittest.TestCase):
             mgr.start()
 
         s1 = next(s for s in mgr.streams if s.stream_id == "stream-1")
-        slot_5_1 = mgr.get_slot("5-1")
+        slot1 = list(config.FURNACE_SLOTS.keys())[0]
+        slot_obj_1 = mgr.get_slot(slot1)
 
-        slot_5_1._handle_maintenance_detected("maintenance class 28 confirmed")
+        slot_obj_1._handle_maintenance_detected("maintenance class 28 confirmed")
 
         if mgr._reeval_thread:
             mgr._reeval_thread.join(timeout=5.0)
 
         self.assertEqual(s1.status, "maintenance")
         self.assertIsNone(s1.assigned_slot)
-        self.assertEqual(slot_5_1.current_stream.stream_id, "stream-2")
+        self.assertEqual(slot_obj_1.current_stream.stream_id, "stream-2")
 
         with patch.object(FurnaceSlot, "stop_monitor"):
             mgr.stop()
@@ -370,35 +405,36 @@ class TestFurnaceManager(unittest.TestCase):
         with patch.object(FurnaceSlot, "start_monitor"):
             mgr.start()
 
+        slot1, slot2 = list(config.FURNACE_SLOTS.keys())[:2]
         s1, s2, s3 = mgr.streams[0], mgr.streams[1], mgr.streams[2]
         s1.mark("maintenance", "simulated maint")
 
-        # Case: 1 under maint, 2 and 3 active -> 2->5/1, 3->5/2
-        mgr._reevaluate_streams(mgr.slots["5-1"])
-        self.assertEqual(mgr.slots["5-1"].current_stream, s2)
-        self.assertEqual(mgr.slots["5-2"].current_stream, s3)
+        # Case: 1 under maint, 2 and 3 active -> 2->slot1, 3->slot2
+        mgr._reevaluate_streams(mgr.slots[slot1])
+        self.assertEqual(mgr.slots[slot1].current_stream, s2)
+        self.assertEqual(mgr.slots[slot2].current_stream, s3)
         self.assertEqual(s1.status, "maintenance")
 
-        # Case: 1 resumes (now 1, 2, 3 are available) -> 1->5/1, 2->5/2, 3 spare
+        # Case: 1 resumes (now 1, 2, 3 are available) -> 1->slot1, 2->slot2, 3 spare
         s1.mark("spare", "resumed")
-        mgr._reevaluate_streams(mgr.slots["5-1"])
-        self.assertEqual(mgr.slots["5-1"].current_stream, s1)
-        self.assertEqual(mgr.slots["5-2"].current_stream, s2)
+        mgr._reevaluate_streams(mgr.slots[slot1])
+        self.assertEqual(mgr.slots[slot1].current_stream, s1)
+        self.assertEqual(mgr.slots[slot2].current_stream, s2)
         self.assertEqual(s3.status, "spare")
 
-        # Case: 2 under maint (1 and 3 available) -> 1->5/1, 3->5/2, 2 maint
+        # Case: 2 under maint (1 and 3 available) -> 1->slot1, 3->slot2, 2 maint
         s2.mark("maintenance", "simulated maint")
-        mgr._reevaluate_streams(mgr.slots["5-1"])
-        self.assertEqual(mgr.slots["5-1"].current_stream, s1)
-        self.assertEqual(mgr.slots["5-2"].current_stream, s3)
+        mgr._reevaluate_streams(mgr.slots[slot1])
+        self.assertEqual(mgr.slots[slot1].current_stream, s1)
+        self.assertEqual(mgr.slots[slot2].current_stream, s3)
         self.assertEqual(s2.status, "maintenance")
 
-        # Case: 3 under maint (1 and 2 available) -> 1->5/1, 2->5/2, 3 maint
+        # Case: 3 under maint (1 and 2 available) -> 1->slot1, 2->slot2, 3 maint
         s2.mark("spare", "resumed")
         s3.mark("maintenance", "simulated maint")
-        mgr._reevaluate_streams(mgr.slots["5-1"])
-        self.assertEqual(mgr.slots["5-1"].current_stream, s1)
-        self.assertEqual(mgr.slots["5-2"].current_stream, s2)
+        mgr._reevaluate_streams(mgr.slots[slot1])
+        self.assertEqual(mgr.slots[slot1].current_stream, s1)
+        self.assertEqual(mgr.slots[slot2].current_stream, s2)
         self.assertEqual(s3.status, "maintenance")
 
         with patch.object(FurnaceSlot, "stop_monitor"):
@@ -406,8 +442,11 @@ class TestFurnaceManager(unittest.TestCase):
 
     @patch.object(FurnaceManager, "_probe_stream")
     def test_probe_for_maintenance_parallel_multiple_hits(self, mock_probe):
+        s1_url = config.STREAMS[0]["rtsp_url"]
+        s2_url = config.STREAMS[1]["rtsp_url"]
+
         def fake_probe(rtsp_url, *args, **kwargs):
-            return "10.50.40.160" in rtsp_url or "10.50.40.158" in rtsp_url
+            return s1_url in rtsp_url or s2_url in rtsp_url
 
         mock_probe.side_effect = fake_probe
         recorder = MagicMock()
@@ -418,19 +457,30 @@ class TestFurnaceManager(unittest.TestCase):
 
     @patch("furnace_manager.CameraWorker")
     @patch.object(FurnaceManager, "_probe_stream")
-    def test_startup_with_multiple_maintenance_hits_assigns_both_slots(self, mock_probe, mock_worker_cls):
-        # Simulate stream-1 having direct maintenance (class 28) and stream-2 having indirect maintenance (fan)
-        def fake_probe(rtsp_url, duration_seconds, *args, **kwargs):
-            if "10.50.40.160" in rtsp_url or "stream-1" in rtsp_url:
-                return "maintenance class 28 confirmed"
-            if "10.50.40.158" in rtsp_url or "stream-2" in rtsp_url:
-                return "maintenance: negative fan detected inside furnace normal-position box"
+    def test_swap_with_cold_spare_stream_maintains_both_slots_and_detection(self, mock_probe, mock_worker_cls):
+        """Regression test for user issue:
+        When an assigned stream (e.g. stream-1) enters maintenance, the spare stream (stream-3)
+        does not have active fire yet (it's cold/idle waiting for scrap charging).
+        Re-evaluation must staff slot 4-1 with stream-2 and slot 4-2 with stream-3,
+        rather than dropping stream-3 and leaving slot 4-2 unassigned with a blank feed.
+        """
+        from state_machine import CLS_FURNACE_ACTIVEFIRE, CLS_FURNACE_OPERATION_UNDERMAINTENANCE
+
+        s2_url = config.STREAMS[1]["rtsp_url"]
+        slot1, slot2 = list(config.FURNACE_SLOTS.keys())[:2]
+
+        def fake_probe(rtsp_url, duration_seconds, target_class=CLS_FURNACE_OPERATION_UNDERMAINTENANCE, *args, **kwargs):
+            if target_class == CLS_FURNACE_OPERATION_UNDERMAINTENANCE:
+                return False
+            if target_class == CLS_FURNACE_ACTIVEFIRE:
+                # stream-2 has active fire; spare stream-3 is cold/idle (NO active fire)
+                return s2_url in rtsp_url or "stream-2" in rtsp_url
             return False
 
         mock_probe.side_effect = fake_probe
+
         recorder = MagicMock()
         mgr = FurnaceManager(recorder)
-
         with patch.object(FurnaceSlot, "start_monitor"):
             mgr.start()
 
@@ -438,47 +488,86 @@ class TestFurnaceManager(unittest.TestCase):
         s2 = next(s for s in mgr.streams if s.stream_id == "stream-2")
         s3 = next(s for s in mgr.streams if s.stream_id == "stream-3")
 
-        # stream-1 has direct class 28 -> marked maintenance
-        self.assertEqual(s1.status, "maintenance")
-        # stream-2 and stream-3 back the two slots
-        self.assertEqual(s2.status, "active")
-        self.assertEqual(s2.assigned_slot, "5-1")
-        self.assertEqual(s3.status, "active")
-        self.assertEqual(s3.assigned_slot, "5-2")
+        slot_obj_1 = mgr.get_slot(slot1)
+        slot_obj_2 = mgr.get_slot(slot2)
 
-        # Both slots MUST have active camera workers
-        self.assertIsNotNone(mgr.slots["5-1"].camera_worker)
-        self.assertIsNotNone(mgr.slots["5-2"].camera_worker)
+        # Initial state before swap
+        self.assertEqual(slot_obj_1.current_stream, s1)
+        self.assertEqual(slot_obj_2.current_stream, s2)
+        self.assertEqual(s3.status, "spare")
+
+        # Trigger maintenance swap on slot 1
+        slot_obj_1._handle_maintenance_detected("maintenance class 28 confirmed")
+        if mgr._reeval_thread:
+            mgr._reeval_thread.join(timeout=5.0)
+
+        # Slot 1 now gets stream-2, Slot 2 gets spare stream-3 even though stream-3 had NO active fire!
+        self.assertEqual(s1.status, "maintenance")
+        self.assertIsNone(s1.assigned_slot)
+        self.assertEqual(s2.status, "active")
+        self.assertEqual(s2.assigned_slot, slot1)
+        self.assertEqual(slot_obj_1.current_stream, s2)
+        self.assertIsNotNone(slot_obj_1.camera_worker)
+        self.assertIsNotNone(slot_obj_1.state_machine)
+
+        # Slot 2 MUST NOT be None or unassigned
+        self.assertEqual(s3.status, "active")
+        self.assertEqual(s3.assigned_slot, slot2)
+        self.assertEqual(slot_obj_2.current_stream, s3)
+        self.assertIsNotNone(slot_obj_2.camera_worker)
+        self.assertIsNotNone(slot_obj_2.state_machine)
+
+        # Swap flags must be cleared
+        self.assertFalse(slot_obj_1._swap_in_progress)
+        self.assertFalse(slot_obj_2._swap_in_progress)
 
         with patch.object(FurnaceSlot, "stop_monitor"):
             mgr.stop()
 
     @patch("furnace_manager.CameraWorker")
     @patch.object(FurnaceManager, "_probe_stream")
-    def test_reevaluate_streams_with_single_activefire_keeps_both_slots(self, mock_probe, mock_worker_cls):
-        # Only stream-3 has active fire, stream-1 is in maintenance, stream-2 is idle (no fire)
-        def fake_probe(rtsp_url, duration_seconds, target_class=None, maintenance_mode=False, *args, **kwargs):
-            if target_class == 5:  # CLS_FURNACE_ACTIVEFIRE
-                return "10.50.40.159" in rtsp_url or "stream-3" in rtsp_url
-            return False
+    def test_check_cold_streams_for_hot_spares(self, mock_probe, mock_worker_cls):
+        """Test that if an assigned slot has been cold, and an unassigned spare warms up,
+        re-evaluation is triggered for the cold slot."""
+        import datetime
+        from state_machine import CLS_FURNACE_ACTIVEFIRE
 
-        mock_probe.side_effect = fake_probe
+        # Return False during startup probe (no stream is in maintenance)
+        mock_probe.return_value = False
+
         recorder = MagicMock()
         mgr = FurnaceManager(recorder)
-
         with patch.object(FurnaceSlot, "start_monitor"):
             mgr.start()
 
-        s1, s2, s3 = mgr.streams[0], mgr.streams[1], mgr.streams[2]
-        s1.mark("maintenance", "direct maintenance")
+        slot1, slot2 = list(config.FURNACE_SLOTS.keys())[:2]
+        cold_slot = mgr.get_slot(slot2)
+        self.assertIsNotNone(cold_slot.state_machine)
+        cold_slot.state_machine.last_activefire_at = (
+            datetime.datetime.now() - datetime.timedelta(minutes=config.COLD_STREAM_MIN_COLD_MINUTES + 1)
+        )
 
-        mgr._reevaluate_streams(mgr.slots["5-1"])
+        spare_stream = next(s for s in mgr.streams if s.assigned_slot is None)
+        self.assertIsNotNone(spare_stream)
 
-        # stream-3 (activefire) is assigned to 5-1; 5-2 is backfilled with stream-2
-        self.assertEqual(mgr.slots["5-1"].current_stream, s3)
-        self.assertEqual(mgr.slots["5-2"].current_stream, s2)
-        self.assertIsNotNone(mgr.slots["5-1"].camera_worker)
-        self.assertIsNotNone(mgr.slots["5-2"].camera_worker)
+        # Mock probe to return True for active fire
+        mock_probe.return_value = True
+
+        with patch.object(mgr, "_trigger_reevaluation") as mock_trigger:
+            mgr._check_cold_streams_for_hot_spares()
+            mock_probe.assert_called_with(
+                spare_stream.rtsp_url,
+                config.PROBE_ACTIVEFIRE_SECONDS,
+                target_class=CLS_FURNACE_ACTIVEFIRE,
+            )
+            mock_trigger.assert_called_once_with(cold_slot)
+
+        # Immediate next call should be throttled by COLD_STREAM_WATCH_SECONDS
+        mock_probe.reset_mock()
+        with patch.object(mgr, "_trigger_reevaluation") as mock_trigger:
+            mgr._check_cold_streams_for_hot_spares()
+            mock_probe.assert_not_called()
+            mock_trigger.assert_not_called()
 
         with patch.object(FurnaceSlot, "stop_monitor"):
             mgr.stop()
