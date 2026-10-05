@@ -1,36 +1,35 @@
-# Furnace Process Monitor
+# Furnace 4 Process Monitor
 
-> **Now watching two furnaces.** This app runs both 4/1 and 4/2 out of one
-> Flask process, each with its own camera, own dashboard page, and own CSV
-> files, all pushed into the same SQL Server database segregated by
-> `FurnaceId`. See `config.py`'s `FURNACES` dict to change either camera's
-> RTSP URL, and jump to **"Two furnaces, one app"** below for the details.
+> **Monitoring Furnace Complex 4.** This service runs both Stand 4/1 and Stand 4/2 out of one
+> unified process, backed by dynamic stream evaluation, separate dashboard endpoints, and distinct
+> telemetry files. All data is persisted into SQL Server segregated by `FurnaceId` (`4/1` and `4/2`).
+> See `config.py` for RTSP stream pool configurations, thresholds, and probe intervals.
 
-A Flask dashboard that watches an RTSP camera feed with a YOLOv11
+A Flask dashboard that watches RTSP camera feeds with a YOLOv11
 *segmentation* model (`best.pt`), figures out which stage of the
 steelmaking heat cycle the furnace is in (scrap charging &rarr; sponge
 charging &rarr; tapping), counts furnace tilts that are *not* tapping, and
 logs the start/end time of every stage to a CSV file per heat.
 
 ```
-furnace_monitor/
-├── app.py              Flask app: routes for BOTH furnaces, video streams, JSON APIs
-├── camera_worker.py    Background thread: RTSP read + YOLO + drawing (one per furnace)
-├── detector.py         Thin YOLO wrapper + segmentation-mask drawing helpers
-├── state_machine.py    The actual process logic (pure Python, unit tested)
+Furnace4/
+├── app.py              Flask app: multi-slot routes, video feeds, JSON APIs
+├── camera_worker.py    Background thread: RTSP read + YOLO segmentation + drawing
+├── furnace_manager.py  Multi-stream orchestrator: maintenance checks, active-fire ranking, slot adoption
+├── detector.py         YOLO segmentation wrapper + mask rendering
+├── state_machine.py    Process state machine with dynamic slot adoption
 ├── debounce.py         Filters single-frame detection flicker
-├── config.py           All the settings you're likely to want to change,
-│                        including FURNACES (per-furnace camera/CSV config)
-├── templates/dashboard.html   one furnace's page (rendered per-furnace)
-├── templates/home.html        furnace picker (only used as a fallback)
+├── config.py           Configuration, 3-camera stream pool, timeouts, intervals
+├── templates/dashboard.html   Furnace dashboard UI
+├── templates/home.html        Furnace selector fallback
 ├── static/css/style.css
-├── static/js/dashboard.js
-├── models/              <- put best.pt here (shared by both furnaces)
-├── data/heats/                4/2's per-heat CSVs (existing, unchanged)
-├── data/heats_index.csv       4/2's heat summary CSV (existing, unchanged)
-├── data/heats_4_1/            4/1's per-heat CSVs (new)
-├── data/heats_index_4_1.csv   4/1's heat summary CSV (new)
-└── tests/test_state_machine.py   run with `python3 tests/test_state_machine.py`
+├── static/js/dashboard.js     Dashboard telemetry & self-healing video reconnect
+├── models/                    YOLO segmentation model weights (.pt)
+├── data/heats/                Stand 4/2's per-heat CSVs
+├── data/heats_index.csv       Stand 4/2's heat summary index
+├── data/heats_4_1/            Stand 4/1's per-heat CSVs
+├── data/heats_index_4_1.csv   Stand 4/1's heat summary index
+└── tests/                     Unit test suite (run with `python -m unittest discover -s tests`)
 ```
 
 ## 0. Two furnaces, one app

@@ -1,82 +1,65 @@
-# Furnace Process Monitor
+# Furnace 5 Process Monitor
 
-> **Now watching two furnaces.** This app runs both 4/1 and 4/2 out of one
-> Flask process, each with its own camera, own dashboard page, and own CSV
-> files, all pushed into the same SQL Server database segregated by
-> `FurnaceId`. See `config.py`'s `FURNACES` dict to change either camera's
-> RTSP URL, and jump to **"Two furnaces, one app"** below for the details.
+> **Monitoring Furnace Complex 5.** This service runs both Stand 5/1 and Stand 5/2 out of one
+> unified process, backed by dynamic stream evaluation, separate dashboard endpoints, and distinct
+> telemetry files. All data is persisted into SQL Server segregated by `FurnaceId` (`5/1` and `5/2`).
+> See `config.py` for RTSP stream pool configurations, thresholds, and probe intervals.
 
-A Flask dashboard that watches an RTSP camera feed with a YOLOv11
-*segmentation* model (`best.pt`), figures out which stage of the
-steelmaking heat cycle the furnace is in (scrap charging &rarr; sponge
-charging &rarr; tapping), counts furnace tilts that are *not* tapping, and
-logs the start/end time of every stage to a CSV file per heat.
+A Flask dashboard that watches RTSP camera feeds with a YOLOv11
+*segmentation* model (`best.pt`), detects the stage of the
+steelmaking heat cycle (scrap charging &rarr; sponge charging &rarr; tapping),
+tracks non-tapping furnace tilts, detects maintenance operations, and
+logs every stage to CSV and SQL Server per heat.
 
 ```
-furnace_monitor/
-├── app.py              Flask app: routes for BOTH furnaces, video streams, JSON APIs
-├── camera_worker.py    Background thread: RTSP read + YOLO + drawing (one per furnace)
-├── detector.py         Thin YOLO wrapper + segmentation-mask drawing helpers
-├── state_machine.py    The actual process logic (pure Python, unit tested)
+Furnace5/
+├── app.py              Flask app: multi-slot routes, video feeds, JSON APIs
+├── camera_worker.py    Background thread: RTSP read + YOLO segmentation + drawing
+├── furnace_manager.py  Multi-stream orchestrator: maintenance checks, active-fire ranking, slot adoption
+├── detector.py         YOLO segmentation wrapper + mask rendering
+├── state_machine.py    Process state machine with dynamic slot adoption
 ├── debounce.py         Filters single-frame detection flicker
-├── config.py           All the settings you're likely to want to change,
-│                        including FURNACES (per-furnace camera/CSV config)
-├── templates/dashboard.html   one furnace's page (rendered per-furnace)
-├── templates/home.html        furnace picker (only used as a fallback)
+├── config.py           Furnace 5 configuration, 3-camera stream pool, timeouts, intervals
+├── purge_long_heats.py Maintenance utility to purge orphan/anomalous heats (>300 mins)
+├── run.sh              Auto-restart runner script for unattended continuous deployment
+├── templates/dashboard.html   Furnace dashboard UI
+├── templates/home.html        Furnace selector fallback
 ├── static/css/style.css
-├── static/js/dashboard.js
-├── models/              <- put best.pt here (shared by both furnaces)
-├── data/heats/                4/2's per-heat CSVs (existing, unchanged)
-├── data/heats_index.csv       4/2's heat summary CSV (existing, unchanged)
-├── data/heats_4_1/            4/1's per-heat CSVs (new)
-├── data/heats_index_4_1.csv   4/1's heat summary CSV (new)
-└── tests/test_state_machine.py   run with `python3 tests/test_state_machine.py`
+├── static/js/dashboard.js     Dashboard telemetry & self-healing video reconnect
+├── models/                    YOLO segmentation model weights (.pt)
+├── data/heats/                Stand 5/2's per-heat CSVs
+├── data/heats_index.csv       Stand 5/2's heat summary index
+├── data/heats_5_1/            Stand 5/1's per-heat CSVs
+├── data/heats_index_5_1.csv   Stand 5/1's heat summary index
+└── tests/                     Unit test suite (run with `python -m unittest discover -s tests`)
 ```
 
-## 0. Two furnaces, one app
+## 0. Two stands, one app
 
-`config.py` has a `FURNACES` dict with one entry per furnace - each one's
-`rtsp_url`, `data_dir`, `index_csv`, and `heat_id_prefix`. 4/2 keeps the
-exact paths it already used (`data/heats`, `data/heats_index.csv`), so
-upgrading to this version doesn't touch or renumber its existing history.
-4/1 is new and gets its own files.
+`config.py` defines the `FURNACES` dictionary with configurations for each stand (`5/1` and `5/2`) - including each one's `data_dir`, `index_csv`, and `heat_id_prefix`.
 
-Once running (`python3 app.py`), each furnace has its own page:
+Once running (`python3 app.py` or `./run.sh`), each furnace stand has its own dashboard:
 
 ```
-http://<machine-ip>:8000/furnace/4-1
-http://<machine-ip>:8000/furnace/4-2
+http://<machine-ip>:8000/furnace/5-1
+http://<machine-ip>:8000/furnace/5-2
 ```
 
-`http://<machine-ip>:8000/` redirects to the default furnace
-(`config.DEFAULT_FURNACE_SLUG`); a small switcher in the top bar of each
-dashboard flips between the two. Both furnaces write into the *same* SQL
-Server `Heats`/`HeatEvents` tables - every row carries a `FurnaceId`
-column (`4/1` or `4/2`) so a query like
-`SELECT * FROM Heats WHERE FurnaceId = '4/1'` (see
-`sql/analysis_queries.sql`) gets just that furnace's data back.
+`http://<machine-ip>:8000/` redirects to the default furnace stand (`config.DEFAULT_FURNACE_SLUG`).
+Both stands write into the *same* SQL Server `Heats` and `HeatEvents` tables - segregated by the `FurnaceId` column (`5/1` or `5/2`).
 
-To point either camera at a different URL without editing `config.py`,
-set the matching environment variable before `python3 app.py`:
+To configure camera streams via environment variables:
 
 ```bash
-export FURNACE_4_1_RTSP="rtsp://user:pass@10.50.40.151:554/video/live?channel=1&subtype=0"
-export FURNACE_4_2_RTSP="rtsp://user:pass@10.50.40.152:554/video/live?channel=1&subtype=0"
+export FURNACE_5_1_RTSP="rtsp://user:pass@10.50.40.151:554/video/live?channel=1&subtype=0"
+export FURNACE_5_2_RTSP="rtsp://user:pass@10.50.40.152:554/video/live?channel=1&subtype=0"
 ```
 
-Both furnaces currently load their own copy of the YOLO model (one per
-camera thread) rather than sharing a single loaded model, which is simpler
-and avoids any question of thread-safety in concurrent `model.predict()`
-calls - the tradeoff is the model's memory footprint is paid twice. If
-that becomes a problem on the deployment machine, that's the place to
-optimize next.
-
-To backfill one furnace's CSV history into SQL Server by hand (the app
-already does this automatically in the background on startup):
+To backfill CSV history into SQL Server manually:
 
 ```bash
-python3 migrate_csv_to_sql.py --furnace-id 4/1
-python3 migrate_csv_to_sql.py --furnace-id 4/2 --dry-run
+python3 migrate_csv_to_sql.py --furnace-id 5/1
+python3 migrate_csv_to_sql.py --furnace-id 5/2 --dry-run
 ```
 
 
