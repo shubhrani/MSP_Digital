@@ -21,6 +21,7 @@ Key rules:
 """
 import csv
 import datetime
+import json
 import os
 import shutil
 import sys
@@ -49,6 +50,11 @@ from state_machine import (
     CLS_MAGNET_FEEDING_SPONGE,
     SCRAP_CHARGING_CLASS_IDS,
     SPONGE_CHARGING_CLASS_IDS,
+    UNDERMAINTENANCE_CLASS_IDS,
+    CLS_COIL_POSITION_PLACEDNEARFURNACE,
+    CLS_FURNACE_OPERATION_PREHEATING,
+    CLS_FURNACE_OPERATION_UNDERMAINTENANCE,
+    CLS_FURMA_POSITION_PLACEDNEARFURNACE,
     TAPPING_END_EXTENSION,
 )
 
@@ -278,10 +284,15 @@ def test_bug_case_old_tilt_followed_by_tapping_much_later():
     assert sm.tap_candidate_start == t24
     assert sm.furnace_moving
 
-    # At 12:01:00 (t(121)), PYRO changes 1560 -> 1572
+    # At 12:01:00 (t(121)), PYRO changes 1560 -> 1572 -> must NOT confirm tapping
     temp_mon.set_temperature(1572.0)
     t_pyro = t(121)
     sm.check_timeouts(t_pyro)
+    assert sm.state == sm.STATE_SPONGE_CHARGING
+    assert sm.tap_candidate_active
+
+    # Class 25 (ladle) confirms tapping at 12:01:00
+    sm.process_detections({CLS_LADDLE_MOVING_WITHMELTIRON}, t_pyro)
 
     # Tapping confirmed and heat finalized immediately
     assert sm.state == sm.STATE_IDLE
@@ -400,33 +411,39 @@ def test_expired_tapping_candidate_without_class_9():
     print("test_expired_tapping_candidate_without_class_9 passed")
 
 
-def test_own_pyro_confirms_tapping():
-    """A PYRO change on this furnace's own monitor confirms tapping."""
+def test_pyro_change_does_not_confirm_tapping():
+    """A PYRO change after class 18 must NOT confirm tapping."""
     own_temp = MockTemperatureMonitor(1560.0)
     own_temp.field = "PYRO4/1"
     sm = fresh_machine(own_temp)
 
-    sm.process_detections({CLS_MAGNET_FEEDING_SCRAP}, t(0))
-    keep_alive(sm, 5, 20)
+    sm.process_detections({CLS_SPONGE_FEEDER_INITIALHEAT}, t(0))
+    keep_alive(sm, 1, 19)
     sm.process_detections({CLS_SPONGE_FEEDER_ON_FURNACE}, t(20))
 
     keep_alive(sm, 21, 29)
-    # Class 24 opens tapping check
-    t24 = t(30)
-    sm.process_detections({CLS_FURNACE_BOTTOM_VISIBLE_COMPLETELY}, t24)
+    # Class 18 opens tapping check
+    t18 = t(30)
+    sm.process_detections({CLS_FURNACE_BOTTOM_VISIBLE_COMPLETELY}, t18)
     assert sm.tap_candidate_active
 
-    # Own furnace PYRO changes at 10:31:00
+    # Own furnace PYRO changes at 10:31:00 -> must NOT confirm tapping
     own_temp.set_temperature(1568.0)
     t_change = t(31)
     sm.check_timeouts(t_change)
 
-    assert sm.state == sm.STATE_IDLE
+    # State remains SPONGE_CHARGING, candidate remains active, no tapping event
+    assert sm.state == sm.STATE_SPONGE_CHARGING
+    assert sm.tap_candidate_active
     events = read_csv(sm.heat_csv_path)
     taps = [e for e in events if e["event"] == "tapping"]
-    assert len(taps) == 1
-    assert "PYRO4/1 changed 1560.0 -> 1568.0" in taps[0]["note"]
-    print("test_own_pyro_confirms_tapping passed")
+    assert len(taps) == 0
+
+    # Advance past 5 minutes without class 25 -> candidate window expires as a tilt
+    sm.check_timeouts(t18 + datetime.timedelta(minutes=5, seconds=1))
+    assert not sm.tap_candidate_active
+    assert sm.tilt_count == 1
+    print("test_pyro_change_does_not_confirm_tapping passed")
 
 
 def test_activefire_loss_callback():
@@ -632,9 +649,20 @@ def test_class_36_starts_tapping_immediately():
     assert sm.state == sm.STATE_TAPPING
     assert sm.tapping_start == t(30)
 
-    # Class 1 at 10:45:00 -> tapping ends, heat completes.
-    keep_alive(sm, 36, 44)
-    sm.process_detections({CLS_FURNACE_NORMAL}, t(45))
+    # Class 1 before any furnace movement must NOT end tapping
+    sm.process_detections({CLS_FURNACE_NORMAL}, t(36))
+    assert sm.state == sm.STATE_TAPPING
+    assert "waiting for furnace movement" in sm.last_event_desc
+
+    # Furnace movement at 10:40:00 (tilting)
+    keep_alive(sm, 37, 39)
+    sm.process_detections({CLS_FURNACE_TILTING}, t(40))
+    assert sm.state == sm.STATE_TAPPING
+    assert sm.tapping_movement_seen is True
+
+    # Class 1 at 10:42:00 -> now tapping ends, heat completes.
+    keep_alive(sm, 41, 41)
+    sm.process_detections({CLS_FURNACE_NORMAL}, t(42))
 
     old_events = read_csv(os.path.join(sm.data_dir, "Heat_001_20260824_100000.csv"))
     taps = [e for e in old_events if e["event"] == "tapping"]
@@ -647,7 +675,7 @@ def test_class_36_starts_tapping_immediately():
     # Sponge charging is closed at the same moment tapping starts.
     assert sponge_evs[0]["end_time"] == t(30).isoformat()
     # Tapping end uses the same extension rule as the existing paths.
-    assert taps[0]["end_time"] == (t(45) + TAPPING_END_EXTENSION).isoformat()
+    assert taps[0]["end_time"] == (t(42) + TAPPING_END_EXTENSION).isoformat()
     print("test_class_36_starts_tapping_immediately passed")
 
 
@@ -673,10 +701,14 @@ def test_class_36_pre_empts_class_18_candidate_window():
     assert not sm.tap_candidate_active
     assert sm.tapping_start == t(31)   # NOT t(30) - 90s = t(28.5)
 
-    keep_alive(sm, 32, 44)
+    # Furnace movement then return to normal ends tapping
+    keep_alive(sm, 32, 39)
+    sm.process_detections({CLS_FURNACE_TILTING}, t(40))
+    keep_alive(sm, 41, 44)
     sm.process_detections({CLS_FURNACE_NORMAL}, t(45))
     old_events = read_csv(os.path.join(sm.data_dir, "Heat_001_20260824_100000.csv"))
     taps = [e for e in old_events if e["event"] == "tapping"]
+    assert len(taps) == 1
     assert taps[0]["start_time"] == t(31).isoformat()
     print("test_class_36_pre_empts_class_18_candidate_window passed")
 
@@ -718,8 +750,13 @@ def test_class_18_path_unchanged():
     sm.process_detections({CLS_FURNACE_BOTTOM_VISIBLE_COMPLETELY}, t18)
     temp_mon.set_temperature(1565.0)
     sm.check_timeouts(t(31))
+    # PYRO change must NOT confirm tapping
+    assert sm.state == sm.STATE_SPONGE_CHARGING
 
-    # Same as the pre-change behaviour: heat completes synchronously.
+    # Class 25 confirms tapping immediately
+    sm.process_detections({CLS_LADDLE_MOVING_WITHMELTIRON}, t(31))
+
+    # Heat completes synchronously on ladle confirmation
     assert sm.state == sm.STATE_IDLE
     old_events = read_csv(os.path.join(sm.data_dir, "Heat_001_20260824_100000.csv"))
     taps = [e for e in old_events if e["event"] == "tapping"]
@@ -879,7 +916,8 @@ def test_resume_recent_incomplete_heat_from_scrap_charging():
 
 def test_resume_old_incomplete_heat_is_aborted():
     shutil.rmtree(TMP_DIR, ignore_errors=True)
-    start = datetime.datetime.now() - datetime.timedelta(minutes=45)
+    # Stale heat must be older than config.RESUME_INCOMPLETE_HEAT_MAX_MINUTES (now 120m)
+    start = datetime.datetime.now() - datetime.timedelta(minutes=config.RESUME_INCOMPLETE_HEAT_MAX_MINUTES + 30)
     hid = f"Heat41_006_{start.strftime('%Y%m%d_%H%M%S')}"
     index_csv = _seed_index(TMP_DIR, [
         [hid, start.isoformat(), "", "", "0", "IN_PROGRESS", f"{hid}.csv"],
@@ -1038,8 +1076,8 @@ def test_no_resume_when_heartbeat_is_stale():
     os.makedirs(os.path.join(TMP_DIR, "heats"), exist_ok=True)
     index_csv = os.path.join(TMP_DIR, "heats_index.csv")
 
-    start = datetime.datetime.now() - datetime.timedelta(hours=1)
-    touched = datetime.datetime.now() - datetime.timedelta(minutes=25)
+    start = datetime.datetime.now() - datetime.timedelta(minutes=config.RESUME_INCOMPLETE_HEAT_MAX_MINUTES + 60)
+    touched = datetime.datetime.now() - datetime.timedelta(minutes=config.RESUME_INCOMPLETE_HEAT_MAX_MINUTES + 15)
     hid = f"Heat41_011_{start.strftime('%Y%m%d_%H%M%S')}"
 
     with open(index_csv, "w", newline="") as f:
@@ -1063,6 +1101,120 @@ def test_no_resume_when_heartbeat_is_stale():
     print("test_no_resume_when_heartbeat_is_stale passed")
 
 
+def test_maintenance_detection_classes():
+    shutil.rmtree(TMP_DIR, ignore_errors=True)
+    os.makedirs(TMP_DIR, exist_ok=True)
+    index_csv = os.path.join(TMP_DIR, "index.csv")
+
+    sm = HeatStateMachine(data_dir=os.path.join(TMP_DIR, "heats"),
+                          index_csv=index_csv,
+                          temperature_monitor=MockTemperatureMonitor())
+
+    classes_to_test = [
+        CLS_COIL_POSITION_PLACEDNEARFURNACE,     # 0
+        CLS_FURNACE_OPERATION_PREHEATING,        # 7
+        CLS_FURNACE_OPERATION_UNDERMAINTENANCE,  # 28
+        CLS_FURMA_POSITION_PLACEDNEARFURNACE,    # 39
+    ]
+
+    t = BASE
+    for cid in classes_to_test:
+        assert cid in UNDERMAINTENANCE_CLASS_IDS
+        assert cid in sm.RELEVANT_CLASS_IDS
+        sm.process_detections({cid}, t)
+        assert "furnace under maintenance" in sm.last_event_desc
+        pending = sm.get_pending_frame_requests()
+        assert len(pending) == 1
+        assert pending[0]["event_name"] == "furnace_undermaintenance"
+        t += datetime.timedelta(seconds=1)
+
+    print("test_maintenance_detection_classes passed")
+
+
+def test_crash_recovery_with_active_state_json():
+    """Verify that state.json persists in-flight heat data and crash recovery restores
+    exact stage, tilt_count, and scrap_charging_confirmed."""
+    shutil.rmtree(TMP_DIR, ignore_errors=True)
+    os.makedirs(TMP_DIR, exist_ok=True)
+    data_dir = os.path.join(TMP_DIR, "heats")
+    index_csv = os.path.join(TMP_DIR, "heats_index.csv")
+
+    sm1 = HeatStateMachine(data_dir=data_dir, index_csv=index_csv,
+                             temperature_monitor=MockTemperatureMonitor())
+
+    t0 = datetime.datetime.now() - datetime.timedelta(minutes=30)
+    # Start heat with scrap
+    sm1.process_detections({CLS_MAGNET_FEEDING_SCRAP}, t0)
+    heat_id = sm1.heat_id
+    assert sm1.state == sm1.STATE_SCRAP_CHARGING
+    assert sm1._scrap_charging_confirmed is True
+
+    # State JSON must exist
+    state_file = os.path.join(data_dir, f"{heat_id}.state.json")
+    assert os.path.exists(state_file)
+
+    # Transition to sponge charging
+    t1 = t0 + datetime.timedelta(minutes=10)
+    sm1.process_detections({CLS_SPONGE_FEEDER_ON_FURNACE}, t1)
+    assert sm1.state == sm1.STATE_SPONGE_CHARGING
+
+    # Perform a tilt
+    t2 = t1 + datetime.timedelta(minutes=5)
+    sm1.process_detections({CLS_FURNACE_TILTING}, t2)
+    t3 = t2 + datetime.timedelta(seconds=20)
+    sm1.process_detections({CLS_FURNACE_NORMAL}, t3)
+    assert sm1.tilt_count == 1
+
+    # Verify state.json content
+    with open(state_file, "r") as f:
+        saved = json.load(f)
+    assert saved["state"] == "SPONGE_CHARGING"
+    assert saved["tilt_count"] == 1
+    assert saved["scrap_charging_confirmed"] is True
+
+    # SIMULATE CORE DUMP & RESTART: destroy sm1 without finalize_tapping
+    del sm1
+
+    # Re-initialize state machine (as would happen on process supervisor restart)
+    sm2 = HeatStateMachine(data_dir=data_dir, index_csv=index_csv,
+                           temperature_monitor=MockTemperatureMonitor())
+
+    # Heat must be seamlessly resumed!
+    assert sm2.heat_id == heat_id
+    assert sm2.state == sm2.STATE_SPONGE_CHARGING
+    assert sm2.tilt_count == 1
+    assert sm2._scrap_charging_confirmed is True
+    # Camera watchdog suspended pending reconnection
+    assert sm2._camera_connected is False
+
+    # Simulate camera connects and detection arrives
+    t4 = datetime.datetime.now()
+    sm2.note_camera_state(True)
+    assert sm2._camera_connected is True
+
+    # Count another tilt on resumed heat
+    t5 = t4 + datetime.timedelta(minutes=2)
+    sm2.process_detections({CLS_FURNACE_TILTING}, t5)
+    t6 = t5 + datetime.timedelta(seconds=20)
+    sm2.process_detections({CLS_FURNACE_NORMAL}, t6)
+    assert sm2.tilt_count == 2
+
+    # Finish tapping
+    t7 = t6 + datetime.timedelta(minutes=5)
+    sm2.process_detections({CLS_LADDLE_PLACED_FORTAPPING}, t7)
+    assert sm2.state == sm2.STATE_TAPPING
+
+    t8 = t7 + datetime.timedelta(minutes=1)
+    sm2.process_detections({CLS_FURNACE_TILTING}, t8)
+    t9 = t8 + datetime.timedelta(seconds=30)
+    sm2.process_detections({CLS_FURNACE_NORMAL}, t9)
+    # Heat completed
+    assert sm2.state == sm2.STATE_SCRAP_CHARGING  # auto_next heat started
+    assert not os.path.exists(state_file)  # completed heat state file cleared
+
+    print("test_crash_recovery_with_active_state_json passed")
+
+
 if __name__ == "__main__":
     test_scrap_charging_class_ids()
     test_sponge_charging_class_ids()
@@ -1072,7 +1224,7 @@ if __name__ == "__main__":
     test_bug_case_old_tilt_followed_by_tapping_much_later()
     test_expired_tapping_candidate()
     test_expired_tapping_candidate_without_class_9()
-    test_own_pyro_confirms_tapping()
+    test_pyro_change_does_not_confirm_tapping()
     test_activefire_loss_callback()
     test_other_triggers_class_25_ladle()
     test_edge_cases_repeat_24_and_class_25_alone()
@@ -1097,5 +1249,7 @@ if __name__ == "__main__":
     test_heartbeat_updates_last_updated_while_running()
     test_resume_uses_last_updated_not_start_time()
     test_no_resume_when_heartbeat_is_stale()
+    test_maintenance_detection_classes()
+    test_crash_recovery_with_active_state_json()
 
     print("\nAll state-machine tests passed successfully!")

@@ -28,3 +28,15 @@ _tmp_data/
 # Files exceeding GitHub 100MB limit
 yolo12x.pt
 **/best(try).pt
+
+# Agent tooling
+.agent/
+.agents/
+.gemini/
+.gsd/
+GSD-STYLE.md
+PROJECT_RULES.md
+VERSION
+adapters/
+model_capabilities.yaml
+scripts/

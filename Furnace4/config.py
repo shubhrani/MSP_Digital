@@ -16,6 +16,12 @@ if os.path.isfile(_env_path):
             _k, _v = _line.split("=", 1)
             os.environ.setdefault(_k.strip(), _v.strip().strip('"').strip("'"))
 
+# Force RTSP over TCP and a sane socket timeout (5s) for every OpenCV VideoCapture across the app.
+os.environ.setdefault(
+    "OPENCV_FFMPEG_CAPTURE_OPTIONS",
+    "rtsp_transport;tcp|stimeout;5000000|max_delay;500000",
+)
+
 # ---------------------------------------------------------------------------
 # Camera / stream
 # ---------------------------------------------------------------------------
@@ -36,7 +42,7 @@ MODEL_PATH = os.getenv(
 )
 
 # Minimum confidence for a detection to be considered at all.
-CONFIDENCE_THRESHOLD = 0.5
+CONFIDENCE_THRESHOLD = 0.3
 
 # Run detection on every Nth frame (1 = every frame). Raise this on slower
 # hardware / CPU-only machines to keep the video feed smooth. The video
@@ -168,6 +174,33 @@ SLOT_POLL_SECONDS = float(os.getenv("SLOT_POLL_SECONDS", "30"))
 # Duration of each stream's active-fire probe. Probes run in PARALLEL, so
 # total wall-clock cost is this value, not 3× this value.
 PROBE_ACTIVEFIRE_SECONDS = float(os.getenv("PROBE_ACTIVEFIRE_SECONDS", "8"))
+
+# Active-fire probe duration used specifically by stream re-evaluation during
+# stream swaps. Must be long enough to survive a brief lull in visible flame
+# without mistakenly treating an active furnace as cold.
+ALLOCATION_ACTIVEFIRE_PROBE_SECONDS: float = float(
+    os.environ.get("FURNACE_ALLOC_ACTIVEFIRE_PROBE_SECONDS", "30.0")
+)
+
+# Interval between informational countdown log entries during stream probes
+# (printed every N seconds so the operator watching the console can see the
+# probe is progressing and how many seconds remain).
+ALLOCATION_PROBE_TICK_SECONDS: float = float(
+    os.environ.get("FURNACE_ALLOC_PROBE_TICK_SECONDS", "5.0")
+)
+
+# Minimum consecutive minutes a stream currently attached to a slot must have
+# seen NO active fire before the watchdog considers it truly cold and eligible
+# for a hot-spare promotion. Avoids thrashing on brief lulls.
+COLD_STREAM_MIN_COLD_MINUTES: float = float(
+    os.environ.get("FURNACE_COLD_STREAM_MIN_COLD_MINUTES", "30.0")
+)
+
+# Frequency with which the furnace_manager watchdog checks whether a currently
+# cold stream can be swapped for a spare that has since warmed up.
+COLD_STREAM_WATCH_SECONDS: float = float(
+    os.environ.get("FURNACE_COLD_STREAM_WATCH_SECONDS", "30.0")
+)
 
 # Backward compatibility alias
 STREAM_ACTIVEFIRE_TIMEOUT_MINUTES = ACTIVEFIRE_TIMEOUT_MINUTES
@@ -313,7 +346,7 @@ SYNC_SINCE_DATE = os.getenv("SYNC_SINCE_DATE", "")
 #
 # Set to 0 to disable resumption entirely (every restart = fresh heat).
 RESUME_INCOMPLETE_HEAT_MAX_MINUTES = float(
-    os.getenv("RESUME_INCOMPLETE_HEAT_MAX_MINUTES", "20")
+    os.getenv("RESUME_INCOMPLETE_HEAT_MAX_MINUTES", "120")   # was 20
 )
 
 

@@ -712,3 +712,31 @@ setInterval(pollHistory, HISTORY_POLL_MS);
 setInterval(pollFrames, FRAMES_POLL_MS);
 setInterval(pollFrameHeats, FRAMES_POLL_MS * 2);
 
+// ---------------------------------------------------------------------
+// Video stream self-healing
+// ---------------------------------------------------------------------
+// The Flask /video_feed route is already written to survive worker swaps
+// (it re-reads slot.camera_worker in a loop). But the browser can still
+// lose the connection on a server restart, a network blip, or a tab
+// suspend. The `error` event is the browser's signal for "the image
+// stream ended" - re-point the src at the same URL after a short delay
+// and MJPEG picks up again.
+(function setupVideoReconnect() {
+  const img = document.getElementById("video");
+  if (!img) return;
+  img.addEventListener("error", () => {
+    setTimeout(() => {
+      img.src = `${API_BASE}/video_feed?t=${Date.now()}`;
+    }, 2000);
+  });
+  // Also reconnect on tab-visibility change: browsers throttle and may
+  // close the underlying connection on long-hidden tabs.
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible"
+        && (!img.complete || img.naturalWidth === 0)) {
+      img.src = `${API_BASE}/video_feed?t=${Date.now()}`;
+    }
+  });
+})();
+
+
