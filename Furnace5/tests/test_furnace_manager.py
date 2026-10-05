@@ -2,6 +2,7 @@
 Unit tests for furnace_manager.py: StreamSource, FurnaceSlot, and FurnaceManager.
 """
 
+import datetime
 import os
 import shutil
 import sys
@@ -14,6 +15,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import config
 from furnace_manager import StreamSource, FurnaceSlot, FurnaceManager
+from state_machine import (
+    CLS_MAGNET_FEEDING_SCRAP,
+    CLS_SPONGE_FEEDER_ON_FURNACE,
+    CLS_FURNACE_TILTING,
+    CLS_FURNACE_NORMAL,
+)
 
 
 class TestFurnaceManager(unittest.TestCase):
@@ -571,6 +578,233 @@ class TestFurnaceManager(unittest.TestCase):
 
         with patch.object(FurnaceSlot, "stop_monitor"):
             mgr.stop()
+
+    @patch("furnace_manager.CameraWorker")
+    def test_stream_swap_preserves_heat_and_tilts(self, mock_cw):
+        recorder = MagicMock()
+        cfg = {
+            "furnace_id": "5/1",
+            "name": "Furnace 5/1",
+            "data_dir": os.path.join(self.tmp_dir, "heats_5_1"),
+            "index_csv": os.path.join(self.tmp_dir, "heats_index_5_1.csv"),
+            "heat_id_prefix": "Heat51",
+            "influx_group": "SFC5/1",
+            "pyro_field": "PYRO5/1",
+        }
+        slot = FurnaceSlot("5-1", cfg, recorder, on_activefire_loss=MagicMock())
+        stream1 = StreamSource({"stream_id": "stream-1", "name": "Camera 1", "rtsp_url": "rtsp://dummy/1"})
+        stream2 = StreamSource({"stream_id": "stream-2", "name": "Camera 2", "rtsp_url": "rtsp://dummy/2"})
+
+        slot.attach_to_stream(stream1)
+        sm = slot.state_machine
+
+        # Start a heat and record a tilt on stream 1
+        t0 = datetime.datetime.now()
+        sm.process_detections({CLS_MAGNET_FEEDING_SCRAP}, t0)
+        heat_id = sm.heat_id
+        sm.process_detections({CLS_SPONGE_FEEDER_ON_FURNACE}, t0 + datetime.timedelta(minutes=5))
+        sm.process_detections({CLS_FURNACE_TILTING}, t0 + datetime.timedelta(minutes=10))
+        sm.process_detections({CLS_FURNACE_NORMAL}, t0 + datetime.timedelta(minutes=10, seconds=30))
+        self.assertEqual(sm.tilt_count, 1)
+        self.assertEqual(sm.state, sm.STATE_SPONGE_CHARGING)
+
+        # Mid-process stream swap to stream 2
+        slot.attach_to_stream(stream2)
+
+        # State machine and in-flight heat must be preserved!
+        self.assertIs(slot.state_machine, sm)
+        self.assertEqual(slot.state_machine.heat_id, heat_id)
+        self.assertEqual(slot.state_machine.state, sm.STATE_SPONGE_CHARGING)
+        self.assertEqual(slot.state_machine.tilt_count, 1)
+
+        # Record another tilt on stream 2
+        sm.process_detections({CLS_FURNACE_TILTING}, t0 + datetime.timedelta(minutes=15))
+        sm.process_detections({CLS_FURNACE_NORMAL}, t0 + datetime.timedelta(minutes=15, seconds=30))
+        self.assertEqual(slot.state_machine.tilt_count, 2)
+
+    @patch("furnace_manager.CameraWorker")
+    @patch.object(FurnaceManager, "_probe_stream")
+    def test_process_shift_on_maintenance_recovery_incomplete_3rd_rtsp(self, mock_probe, mock_cw):
+        """When rtsp2 is on slot1 and rtsp3 on slot2, and rtsp1 comes out of maintenance:
+        - Process of slot1 shifts to slot2 with rtsp2
+        - Current incomplete process of 3rd rtsp shifts to slot1 with rtsp1
+        """
+        from state_machine import CLS_FURNACE_ACTIVEFIRE, CLS_MAGNET_FEEDING_SCRAP, CLS_SPONGE_FEEDER_ON_FURNACE
+
+        # Stream 1 in maintenance initially
+        def fake_probe(rtsp_url, duration_seconds, *args, **kwargs):
+            return "stream-1" in rtsp_url or "10.50.40.158" in rtsp_url
+
+        mock_probe.side_effect = fake_probe
+
+        test_slots_cfg = {
+            "5-1": {
+                "furnace_id": "5/1",
+                "name": "Furnace 5/1",
+                "data_dir": os.path.join(self.tmp_dir, "heats_5_1"),
+                "index_csv": os.path.join(self.tmp_dir, "heats_index_5_1.csv"),
+                "heat_id_prefix": "Heat51",
+                "influx_group": "SFC5/1",
+                "pyro_field": "PYRO5/1",
+            },
+            "5-2": {
+                "furnace_id": "5/2",
+                "name": "Furnace 5/2",
+                "data_dir": os.path.join(self.tmp_dir, "heats"),
+                "index_csv": os.path.join(self.tmp_dir, "heats_index.csv"),
+                "heat_id_prefix": "Heat",
+                "influx_group": "SFC5/2",
+                "pyro_field": "PYRO5/2",
+            },
+        }
+
+        with patch.dict(config.FURNACE_SLOTS, test_slots_cfg, clear=True):
+            recorder = MagicMock()
+            mgr = FurnaceManager(recorder)
+
+            with patch.object(FurnaceSlot, "start_monitor"):
+                mgr.start()
+
+            s1 = next(s for s in mgr.streams if s.stream_id == "stream-1")
+            s2 = next(s for s in mgr.streams if s.stream_id == "stream-2")
+            s3 = next(s for s in mgr.streams if s.stream_id == "stream-3")
+
+            slot_5_1 = mgr.get_slot("5-1")
+            slot_5_2 = mgr.get_slot("5-2")
+
+            # Initial state: s1 maintenance, s2 on 5-1, s3 on 5-2
+            self.assertEqual(s1.status, "maintenance")
+            self.assertEqual(slot_5_1.current_stream, s2)
+            self.assertEqual(slot_5_2.current_stream, s3)
+
+            # Start Heat 1 on slot 5-1 (with stream-2)
+            t0 = datetime.datetime.now()
+            sm_slot1 = slot_5_1.state_machine
+            sm_slot1.process_detections({CLS_MAGNET_FEEDING_SCRAP}, t0)
+            sm_slot1.process_detections({CLS_SPONGE_FEEDER_ON_FURNACE}, t0 + datetime.timedelta(minutes=5))
+            heat1_id = sm_slot1.heat_id
+            self.assertEqual(sm_slot1.state, sm_slot1.STATE_SPONGE_CHARGING)
+
+            # Start Heat 2 on slot 5-2 (with stream-3)
+            sm_slot2 = slot_5_2.state_machine
+            sm_slot2.process_detections({CLS_MAGNET_FEEDING_SCRAP}, t0)
+            heat2_id = sm_slot2.heat_id
+            self.assertEqual(sm_slot2.state, sm_slot2.STATE_SCRAP_CHARGING)
+
+            # Now simulate rtsp1 getting out of maintenance:
+            def fake_probe_after(rtsp_url, duration_seconds, target_class=None, *args, **kwargs):
+                if target_class == CLS_FURNACE_ACTIVEFIRE:
+                    return "10.50.40.158" in rtsp_url or "10.50.40.159" in rtsp_url or "stream-1" in rtsp_url or "stream-2" in rtsp_url
+                return False
+
+            mock_probe.side_effect = fake_probe_after
+
+            # Clear maintenance flag on stream-1
+            s1.mark("spare", "maintenance cleared")
+
+            # Trigger re-evaluation
+            mgr._reevaluate_streams(slot_5_1)
+
+            # Invariant checks:
+            # 1. rtsp2 is now on slot 5-2
+            self.assertEqual(slot_5_2.current_stream, s2)
+            # Process of slot 1 shifted to slot 5-2 with rtsp2!
+            self.assertIs(slot_5_2.state_machine, sm_slot1)
+            self.assertEqual(slot_5_2.state_machine.heat_id, heat1_id)
+            self.assertEqual(slot_5_2.state_machine.state, sm_slot1.STATE_SPONGE_CHARGING)
+            self.assertEqual(slot_5_2.state_machine.furnace_id, "5/2")
+            self.assertIs(slot_5_2.state_machine.temperature_monitor, slot_5_2.temperature_monitor)
+
+            # 2. rtsp1 is now on slot 5-1
+            self.assertEqual(slot_5_1.current_stream, s1)
+            # Current incomplete process of 3rd rtsp (from slot 5-2) shifted to slot 5-1!
+            self.assertIs(slot_5_1.state_machine, sm_slot2)
+            self.assertEqual(slot_5_1.state_machine.heat_id, heat2_id)
+            self.assertEqual(slot_5_1.state_machine.state, sm_slot2.STATE_SCRAP_CHARGING)
+            self.assertEqual(slot_5_1.state_machine.furnace_id, "5/1")
+            self.assertIs(slot_5_1.state_machine.temperature_monitor, slot_5_1.temperature_monitor)
+
+            with patch.object(FurnaceSlot, "stop_monitor"):
+                mgr.stop()
+
+    @patch("furnace_manager.CameraWorker")
+    @patch.object(FurnaceManager, "_probe_stream")
+    def test_process_shift_on_maintenance_recovery_completed_3rd_rtsp(self, mock_probe, mock_cw):
+        """When 3rd rtsp process is completed (IDLE), slot1 receives a fresh state machine."""
+        from state_machine import CLS_FURNACE_ACTIVEFIRE, CLS_MAGNET_FEEDING_SCRAP
+
+        def fake_probe(rtsp_url, duration_seconds, *args, **kwargs):
+            return "stream-1" in rtsp_url or "10.50.40.158" in rtsp_url
+
+        mock_probe.side_effect = fake_probe
+
+        test_slots_cfg = {
+            "5-1": {
+                "furnace_id": "5/1",
+                "name": "Furnace 5/1",
+                "data_dir": os.path.join(self.tmp_dir, "heats_5_1"),
+                "index_csv": os.path.join(self.tmp_dir, "heats_index_5_1.csv"),
+                "heat_id_prefix": "Heat51",
+                "influx_group": "SFC5/1",
+                "pyro_field": "PYRO5/1",
+            },
+            "5-2": {
+                "furnace_id": "5/2",
+                "name": "Furnace 5/2",
+                "data_dir": os.path.join(self.tmp_dir, "heats"),
+                "index_csv": os.path.join(self.tmp_dir, "heats_index.csv"),
+                "heat_id_prefix": "Heat",
+                "influx_group": "SFC5/2",
+                "pyro_field": "PYRO5/2",
+            },
+        }
+
+        with patch.dict(config.FURNACE_SLOTS, test_slots_cfg, clear=True):
+            recorder = MagicMock()
+            mgr = FurnaceManager(recorder)
+
+            with patch.object(FurnaceSlot, "start_monitor"):
+                mgr.start()
+
+            s1 = next(s for s in mgr.streams if s.stream_id == "stream-1")
+            s2 = next(s for s in mgr.streams if s.stream_id == "stream-2")
+            s3 = next(s for s in mgr.streams if s.stream_id == "stream-3")
+
+            slot_5_1 = mgr.get_slot("5-1")
+            slot_5_2 = mgr.get_slot("5-2")
+
+            # Slot 5-1 has an active heat
+            t0 = datetime.datetime.now()
+            sm_slot1 = slot_5_1.state_machine
+            sm_slot1.process_detections({CLS_MAGNET_FEEDING_SCRAP}, t0)
+            heat1_id = sm_slot1.heat_id
+
+            # Slot 5-2 is IDLE (process completed)
+            self.assertEqual(slot_5_2.state_machine.state, slot_5_2.state_machine.STATE_IDLE)
+
+            def fake_probe_after(rtsp_url, duration_seconds, target_class=None, *args, **kwargs):
+                if target_class == CLS_FURNACE_ACTIVEFIRE:
+                    return "10.50.40.158" in rtsp_url or "10.50.40.159" in rtsp_url or "stream-1" in rtsp_url or "stream-2" in rtsp_url
+                return False
+
+            mock_probe.side_effect = fake_probe_after
+            s1.mark("spare", "maintenance cleared")
+
+            # Trigger re-evaluation
+            mgr._reevaluate_streams(slot_5_1)
+
+            # Slot 5-2 gets slot 1's active heat
+            self.assertEqual(slot_5_2.current_stream, s2)
+            self.assertIs(slot_5_2.state_machine, sm_slot1)
+            self.assertEqual(slot_5_2.state_machine.heat_id, heat1_id)
+
+            # Slot 5-1 gets stream-1 and is IDLE (fresh SM, since 3rd rtsp had no incomplete heat)
+            self.assertEqual(slot_5_1.current_stream, s1)
+            self.assertEqual(slot_5_1.state_machine.state, slot_5_1.state_machine.STATE_IDLE)
+            self.assertIsNone(slot_5_1.state_machine.heat_id)
+
+            with patch.object(FurnaceSlot, "stop_monitor"):
+                mgr.stop()
 
 
 if __name__ == "__main__":

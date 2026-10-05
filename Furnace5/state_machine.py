@@ -78,6 +78,7 @@ Process sequence (43-class model + InfluxDB PYRO temperature):
 
 import csv
 import datetime
+import json
 import logging
 import os
 import random
@@ -352,6 +353,12 @@ class HeatStateMachine:
         newly_confirmed_ids = set(newly_confirmed_ids) if newly_confirmed_ids else set()
 
         with self._lock:
+            # If camera was suspended pending connection, arriving detections mark it connected
+            if not self._camera_connected:
+                self._camera_connected = True
+                self._camera_down_since = None
+                self.last_activefire_at = timestamp
+
             # Active-fire sighting updates the watchdog clock
             if newly_confirmed_ids & ACTIVEFIRE_CLASS_IDS:
                 self.last_activefire_at = timestamp
@@ -385,6 +392,7 @@ class HeatStateMachine:
                     # Real scrap-feed class confirmed -> the provisional heat is
                     # now a genuine heat, so the 45-min scrap cap must NOT abort it.
                     self._scrap_charging_confirmed = True
+                    self._save_active_state()
                 # (no case for STATE_SPONGE_CHARGING — scrap during sponge
                 # charging is now ignored, sponge keeps running)
 
@@ -666,6 +674,7 @@ class HeatStateMachine:
         except OSError:
             logger.exception("Could not remove heat CSV %s", heat_csv_path)
         self._remove_index_row(heat_id)
+        self._clear_active_state(heat_id)
 
         self.heat_id = None
         self.heat_csv_path = None
@@ -717,6 +726,7 @@ class HeatStateMachine:
         except OSError:
             logger.exception("Could not remove heat CSV %s", heat_csv_path)
         self._remove_index_row(heat_id)
+        self._clear_active_state(heat_id)
 
         # Reset all heat state - mirrors _abort_heat_no_activefire.
         self.heat_id = None
@@ -779,6 +789,7 @@ class HeatStateMachine:
             self._notify_event_start("scrap_charging", timestamp)
             self._request_frame("scrap_charging_start", timestamp,
                                 "new heat started - scrap charging")
+        self._save_active_state()
 
     def _end_scrap_start_sponge(self, timestamp, note=""):
         self._log_event("scrap_charging", self.scrap_start, timestamp, note=note)
@@ -789,6 +800,7 @@ class HeatStateMachine:
         self._notify_event_start("sponge_charging", timestamp)
         self._request_frame("sponge_charging_start", timestamp,
                             f"scrap -> sponge ({note or 'sponge class confirmed'})")
+        self._save_active_state()
 
     def _reset_furnace_watch(self):
         self.furnace_moving = False
@@ -870,6 +882,7 @@ class HeatStateMachine:
         self.last_event_desc = f"{self.heat_id}: furnace back to normal - tilt #{self.tilt_count}"
         self._request_frame(f"tilt_{self.tilt_count}", move_end,
                             f"furnace movement resolved as tilt #{self.tilt_count}")
+        self._save_active_state()
 
     def _begin_tapping_from_ladle(self, timestamp):
         """Class 36 (laddle_placed_fortapping) is a first-class tapping trigger.
@@ -893,6 +906,7 @@ class HeatStateMachine:
         # actually seen the furnace leave normal position (tilt / bottom
         # visible) and then come back.
         self.tapping_requires_movement = True
+        self._save_active_state()
 
     def _begin_tapping_candidate(self, timestamp, opener_cls=None):
         self.tap_candidate_active = True
@@ -922,6 +936,7 @@ class HeatStateMachine:
             "tapping_candidate_opened", timestamp,
             f"{self.tap_candidate_opener} - tapping candidate window opened",
         )
+        self._save_active_state()
 
     def _check_tapping_candidate(self, timestamp):
         """Checks if the candidate window has expired.
@@ -974,6 +989,8 @@ class HeatStateMachine:
         elif move_start is not None:
             # No clear return during the window: use class-18 start -> deadline.
             self._count_tilt(move_start, deadline)
+        else:
+            self._save_active_state()
 
     def _confirm_tapping(self, end_timestamp, note):
         start = self.tap_candidate_start - TAPPING_PRE_ROLL      # 1.5 min before 18
@@ -1014,6 +1031,7 @@ class HeatStateMachine:
         )
         self._request_frame("tapping_start", tapping_start_time,
                             f"tapping started ({note or 'ladle confirmed'})")
+        self._save_active_state()
 
     def _finalize_tapping(self, end_timestamp, reason="", auto_next=False):
         """Ends tapping and completes the heat.
@@ -1082,6 +1100,7 @@ class HeatStateMachine:
         )
         self.state = self.STATE_IDLE
         self.tapping_start = None
+        self._clear_active_state(completed_heat_id)
 
         if auto_next:
             # Start the next heat in scrap charging at the extended tap end.
@@ -1171,6 +1190,70 @@ class HeatStateMachine:
             return last_num
 
     # -----------------------------------------------------------------
+    # Active state persistence (JSON)
+    # -----------------------------------------------------------------
+    def _state_file_path(self, heat_id=None):
+        hid = heat_id or self.heat_id
+        if not hid:
+            return None
+        return os.path.join(self.data_dir, f"{hid}.state.json")
+
+    def _save_active_state(self):
+        """Atomically persist in-memory heat state to disk so crashes or
+        restarts seamlessly restore exact stage, tilts, and flags without
+        breaking an in-progress process."""
+        path = self._state_file_path()
+        if not path or not self.heat_id or self.state == self.STATE_IDLE:
+            return
+
+        payload = {
+            "heat_id": self.heat_id,
+            "heat_number": self.heat_number,
+            "furnace_id": self.furnace_id,
+            "state": self.state,
+            "heat_start": self.heat_start.isoformat() if self.heat_start else None,
+            "scrap_start": self.scrap_start.isoformat() if self.scrap_start else None,
+            "sponge_start": self.sponge_start.isoformat() if self.sponge_start else None,
+            "tapping_start": self.tapping_start.isoformat() if self.tapping_start else None,
+            "tilt_count": self.tilt_count,
+            "scrap_charging_confirmed": self._scrap_charging_confirmed,
+            "furnace_moving": self.furnace_moving,
+            "furnace_move_start": self.furnace_move_start.isoformat() if self.furnace_move_start else None,
+            "last_tilt_end": self.last_tilt_end.isoformat() if self.last_tilt_end else None,
+            "tap_candidate_active": self.tap_candidate_active,
+            "tap_candidate_start": self.tap_candidate_start.isoformat() if self.tap_candidate_start else None,
+            "tap_candidate_deadline": self.tap_candidate_deadline.isoformat() if self.tap_candidate_deadline else None,
+            "tap_candidate_opener": self.tap_candidate_opener,
+            "tapping_requires_movement": self.tapping_requires_movement,
+            "tapping_movement_seen": self.tapping_movement_seen,
+            "last_activefire_at": self.last_activefire_at.isoformat() if self.last_activefire_at else None,
+            "last_event_desc": self.last_event_desc,
+            "updated_at": datetime.datetime.now().isoformat(),
+        }
+
+        tmp_path = f"{path}.tmp"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+            os.replace(tmp_path, path)
+        except Exception:
+            logger.exception("Failed to write active state to %s", path)
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:
+                pass
+
+    def _clear_active_state(self, heat_id=None):
+        """Remove active state file when heat completes or aborts."""
+        path = self._state_file_path(heat_id)
+        if path and os.path.exists(path):
+            try:
+                os.remove(path)
+            except OSError:
+                logger.exception("Failed to remove active state file %s", path)
+
+    # -----------------------------------------------------------------
     # Startup resume
     # -----------------------------------------------------------------
     def _resume_incomplete_heat_if_recent(self):
@@ -1236,6 +1319,7 @@ class HeatStateMachine:
                 hid, status="ABORTED",
                 end=(end_dt if end_dt != datetime.datetime.min else None),
             )
+            self._clear_active_state(hid)
 
         hid = candidate.get("heat_id")
         last_touch = _row_last_touch(candidate)
@@ -1247,6 +1331,7 @@ class HeatStateMachine:
                     "last_updated/start_time - marking ABORTED.", hid,
                 )
                 self._update_index_row(hid, status="ABORTED")
+                self._clear_active_state(hid)
             return
 
         age_minutes = (now - last_touch).total_seconds() / 60.0
@@ -1259,6 +1344,7 @@ class HeatStateMachine:
                 hid, age_minutes, limit,
             )
             self._update_index_row(hid, status="ABORTED", end=last_touch)
+            self._clear_active_state(hid)
             return
 
         # start_time is what the heat actually began at (used for the CSV /
@@ -1272,8 +1358,8 @@ class HeatStateMachine:
         self._restore_heat_from_disk(index_rows, candidate, start_dt, last_touch)
 
     def _restore_heat_from_disk(self, index_rows, index_row, start_dt, last_touch):
-        """Repopulate the state machine's live state from the on-disk CSV
-        index row plus its per-heat CSV. Called only from
+        """Repopulate the state machine's live state from on-disk state JSON
+        plus its per-heat CSV. Called only from
         _resume_incomplete_heat_if_recent (verified candidate)."""
         age_minutes = (datetime.datetime.now() - last_touch).total_seconds() / 60.0
         heat_id = index_row["heat_id"]
@@ -1286,6 +1372,7 @@ class HeatStateMachine:
                 "ABORTED.", heat_id, csv_path,
             )
             self._update_index_row(heat_id, status="ABORTED", end=datetime.datetime.now())
+            self._clear_active_state(heat_id)
             return
 
         try:
@@ -1296,6 +1383,7 @@ class HeatStateMachine:
                 "Startup: failed reading %s - marking ABORTED.", csv_path,
             )
             self._update_index_row(heat_id, status="ABORTED", end=datetime.datetime.now())
+            self._clear_active_state(heat_id)
             return
 
         # --- Identity ------------------------------------------------------
@@ -1315,54 +1403,6 @@ class HeatStateMachine:
         if tilt_events:
             self.last_tilt_end = self._parse_iso_or_none(tilt_events[-1].get("end_time"))
 
-        # --- Stage ---------------------------------------------------------
-        # The heat CSV only logs a stage row at its *end*:
-        #   * scrap_charging  row  -> heat moved to SPONGE_CHARGING
-        #   * sponge_charging row  -> heat moved to TAPPING (transient)
-        #   * tapping         row  -> heat COMPLETED (never IN_PROGRESS here)
-        scrap_ev  = next((e for e in events if e.get("event") == "scrap_charging"), None)
-        sponge_ev = next((e for e in events if e.get("event") == "sponge_charging"), None)
-        tap_ev    = next((e for e in events if e.get("event") == "tapping"), None)
-
-        self.tapping_start = None
-
-        if tap_ev:
-            # Extremely unlikely (a completed heat shouldn't be IN_PROGRESS),
-            # but degrade gracefully - continue as if we were still sponging.
-            logger.warning(
-                "Startup: %s has a tapping event yet was IN_PROGRESS - "
-                "resuming in SPONGE_CHARGING.", heat_id,
-            )
-            self.state = self.STATE_SPONGE_CHARGING
-            self.scrap_start  = self._parse_iso_or_none(scrap_ev.get("start_time"))  if scrap_ev  else start_dt
-            self.sponge_start = self._parse_iso_or_none(sponge_ev.get("start_time")) if sponge_ev else start_dt
-
-        elif sponge_ev:
-            # Crash landed between "_enter_tapping logged sponge_charging" and
-            # "_finalize_tapping logged tapping" - genuinely mid-TAPPING.
-            self.state = self.STATE_TAPPING
-            self.scrap_start  = self._parse_iso_or_none(scrap_ev.get("start_time")) if scrap_ev else start_dt
-            self.sponge_start = self._parse_iso_or_none(scrap_ev.get("end_time"))   if scrap_ev else start_dt
-            # _enter_tapping sets tapping_start = sponge_end_time
-            self.tapping_start = (
-                self._parse_iso_or_none(sponge_ev.get("end_time"))
-                or self._parse_iso_or_none(sponge_ev.get("start_time"))
-                or start_dt
-            )
-
-        elif scrap_ev:
-            # scrap_charging row present, sponge_charging row absent -> still
-            # in SPONGE_CHARGING (sponge phase started at scrap.end_time).
-            self.state = self.STATE_SPONGE_CHARGING
-            self.scrap_start  = self._parse_iso_or_none(scrap_ev.get("start_time")) or start_dt
-            self.sponge_start = self._parse_iso_or_none(scrap_ev.get("end_time"))   or start_dt
-
-        else:
-            # No stage transitions yet - still waiting on sponge class.
-            self.state = self.STATE_SCRAP_CHARGING
-            self.scrap_start = start_dt
-            self.sponge_start = None
-
         # --- Restore completed_events for get_status() / UI -----------------
         self.completed_events = []
         for i, e in enumerate(events):
@@ -1370,19 +1410,100 @@ class HeatStateMachine:
             d["event_ordinal"] = i
             self.completed_events.append(d)
 
-        # --- Provisional-heat inference ------------------------------------
-        # A heat is "provisional" (needs a scrap class to be confirmed) iff it
-        # was auto-started at the exact instant the previous heat's tapping
-        # ended. _finalize_tapping does that by writing COMPLETE(end=extended)
-        # and then _start_new_heat(extended) - both rows therefore share the
-        # identical start_time == end_time. Detect that to preserve the
-        # scrap-abort semantics from the previous patch.
-        was_tap_initiated = self._was_tap_end_initiated(index_rows, index_row)
-        self._scrap_charging_confirmed = not was_tap_initiated
+        # --- Check for active state JSON file ------------------------------
+        state_file = self._state_file_path(heat_id)
+        state_data = None
+        if state_file and os.path.exists(state_file):
+            try:
+                with open(state_file, "r", encoding="utf-8") as f:
+                    state_data = json.load(f)
+            except Exception:
+                logger.exception(
+                    "Startup: failed reading active state file %s - falling back to CSV.",
+                    state_file,
+                )
+
+        if state_data and isinstance(state_data, dict):
+            logger.info("Startup: restoring exact heat state from %s", state_file)
+            saved_state = state_data.get("state")
+            if saved_state in (self.STATE_SCRAP_CHARGING, self.STATE_SPONGE_CHARGING, self.STATE_TAPPING):
+                self.state = saved_state
+
+            self.scrap_start = self._parse_iso_or_none(state_data.get("scrap_start")) or (
+                start_dt if self.state == self.STATE_SCRAP_CHARGING else None
+            )
+            self.sponge_start = self._parse_iso_or_none(state_data.get("sponge_start")) or self.sponge_start
+            self.tapping_start = self._parse_iso_or_none(state_data.get("tapping_start")) or self.tapping_start
+
+            if "tilt_count" in state_data:
+                self.tilt_count = max(self.tilt_count, int(state_data["tilt_count"]))
+
+            if "scrap_charging_confirmed" in state_data:
+                self._scrap_charging_confirmed = bool(state_data["scrap_charging_confirmed"])
+            elif self.state in (self.STATE_SPONGE_CHARGING, self.STATE_TAPPING):
+                self._scrap_charging_confirmed = True
+            else:
+                self._scrap_charging_confirmed = not self._was_tap_end_initiated(index_rows, index_row)
+
+            self.tapping_requires_movement = bool(state_data.get("tapping_requires_movement", False))
+            self.tapping_movement_seen = bool(state_data.get("tapping_movement_seen", False))
+            if state_data.get("last_tilt_end"):
+                self.last_tilt_end = self._parse_iso_or_none(state_data.get("last_tilt_end")) or self.last_tilt_end
+        else:
+            # Fallback to CSV reconstruction:
+            scrap_ev = next((e for e in events if e.get("event") == "scrap_charging"), None)
+            sponge_ev = next((e for e in events if e.get("event") == "sponge_charging"), None)
+            tap_ev = next((e for e in events if e.get("event") == "tapping"), None)
+            scrap_unknown_ev = next((e for e in events if e.get("event") == "scrap_charging_unknown"), None)
+
+            self.tapping_start = None
+
+            if tap_ev:
+                logger.warning(
+                    "Startup: %s has a tapping event yet was IN_PROGRESS - "
+                    "resuming in SPONGE_CHARGING.", heat_id,
+                )
+                self.state = self.STATE_SPONGE_CHARGING
+                self.scrap_start = self._parse_iso_or_none(scrap_ev.get("start_time")) if scrap_ev else start_dt
+                self.sponge_start = self._parse_iso_or_none(sponge_ev.get("start_time")) if sponge_ev else start_dt
+                self._scrap_charging_confirmed = True
+
+            elif sponge_ev:
+                self.state = self.STATE_TAPPING
+                self.scrap_start = self._parse_iso_or_none(scrap_ev.get("start_time")) if scrap_ev else start_dt
+                self.sponge_start = self._parse_iso_or_none(scrap_ev.get("end_time")) if scrap_ev else start_dt
+                self.tapping_start = (
+                    self._parse_iso_or_none(sponge_ev.get("end_time"))
+                    or self._parse_iso_or_none(sponge_ev.get("start_time"))
+                    or start_dt
+                )
+                self._scrap_charging_confirmed = True
+
+            elif scrap_ev:
+                self.state = self.STATE_SPONGE_CHARGING
+                self.scrap_start = self._parse_iso_or_none(scrap_ev.get("start_time")) or start_dt
+                self.sponge_start = self._parse_iso_or_none(scrap_ev.get("end_time")) or start_dt
+                self._scrap_charging_confirmed = True
+
+            elif scrap_unknown_ev:
+                self.state = self.STATE_SPONGE_CHARGING
+                self.scrap_start = None
+                self.sponge_start = start_dt
+                self._scrap_charging_confirmed = True
+
+            else:
+                self.state = self.STATE_SCRAP_CHARGING
+                self.scrap_start = start_dt
+                self.sponge_start = None
+                was_tap_initiated = self._was_tap_end_initiated(index_rows, index_row)
+                self._scrap_charging_confirmed = not was_tap_initiated
 
         # --- Watchdog clock -------------------------------------------------
         # We can't know whether class 5 was seen while the app was down; a
         # fresh clock avoids an immediate false abort on the first frame back.
+        # Suspend watchdog until CameraWorker actually connects.
+        self._camera_connected = False
+        self._camera_down_since = datetime.datetime.now()
         self.last_activefire_at = datetime.datetime.now()
 
         # --- Mid-process recovery is now moot -------------------------------
@@ -1400,6 +1521,9 @@ class HeatStateMachine:
             heat_id, age_minutes, self.state, self.tilt_count,
             len(events), self._scrap_charging_confirmed,
         )
+
+        # Immediately persist the restored state back to disk
+        self._save_active_state()
 
     def _was_tap_end_initiated(self, index_rows, this_row):
         """True iff a COMPLETE row in the index has end_time == this row's
@@ -1517,6 +1641,7 @@ class HeatStateMachine:
                 w.writeheader()
                 for r in rows:
                     w.writerow({k: r.get(k, "") for k in INDEX_HEADERS})
+            self._save_active_state()
         except OSError:
             logger.exception("Could not touch index row for %s", self.heat_id)
 

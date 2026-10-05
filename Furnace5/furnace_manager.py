@@ -19,8 +19,11 @@ slot is never touched - its heat, its CSV, its in-flight taps all keep
 running.
 """
 
+import csv
 import datetime
 import logging
+import os
+import shutil
 import threading
 import time
 
@@ -36,6 +39,7 @@ from camera_worker import (
 from debounce import ClassDebouncer
 from state_machine import (
     HeatStateMachine,
+    INDEX_HEADERS,
     CLS_COIL_POSITION_PLACEDNEARFURNACE,      # 0
     CLS_FURNACE_OPERATION_PREHEATING,         # 7
     CLS_FURNACE_OPERATION_UNDERMAINTENANCE,   # 28
@@ -142,24 +146,182 @@ class FurnaceSlot:
         except Exception:
             pass
 
+    def adopt_state_machine(self, sm, source_slot=None):
+        """Adopt and rebind an in-flight or idle HeatStateMachine from another slot.
+        Updates slot-specific configuration (data_dir, index_csv, furnace_id,
+        heat_id_prefix, temperature_monitor, on_activefire_loss) and transfers
+        on-disk artifacts (heat CSV, active state JSON, index rows) if an active
+        heat is in progress.
+        """
+        if sm is None:
+            self.state_machine = None
+            return None
+
+        if source_slot is not None and source_slot.slug == self.slug:
+            self.state_machine = sm
+            return sm
+
+        with sm._lock:
+            old_data_dir = sm.data_dir
+            old_index_csv = sm.index_csv
+            heat_id = sm.heat_id
+
+            sm.data_dir = self.data_dir
+            sm.index_csv = self.index_csv
+            sm.furnace_id = self.furnace_id
+            sm.heat_id_prefix = self.heat_id_prefix
+            sm.temperature_monitor = self.temperature_monitor
+            sm._on_activefire_loss = self._handle_activefire_loss
+
+            is_incomplete = (
+                heat_id is not None
+                and getattr(sm, "state", None) != HeatStateMachine.STATE_IDLE
+            )
+
+            if not is_incomplete:
+                sm.heat_number = sm._load_last_heat_number()
+                self.state_machine = sm
+                return sm
+
+            # Active incomplete heat: migrate files and index entry
+            os.makedirs(self.data_dir, exist_ok=True)
+
+            if sm.heat_csv_path and os.path.exists(sm.heat_csv_path):
+                new_csv_path = os.path.join(self.data_dir, os.path.basename(sm.heat_csv_path))
+                if os.path.abspath(sm.heat_csv_path) != os.path.abspath(new_csv_path):
+                    try:
+                        shutil.copy2(sm.heat_csv_path, new_csv_path)
+                        try:
+                            os.remove(sm.heat_csv_path)
+                        except OSError:
+                            pass
+                        sm.heat_csv_path = new_csv_path
+                    except Exception:
+                        logger.exception("Failed copying heat CSV to %s", new_csv_path)
+
+            old_active = os.path.join(old_data_dir, f".{heat_id}.active.json")
+            new_active = os.path.join(self.data_dir, f".{heat_id}.active.json")
+            if os.path.exists(old_active) and os.path.abspath(old_active) != os.path.abspath(new_active):
+                try:
+                    shutil.copy2(old_active, new_active)
+                    try:
+                        os.remove(old_active)
+                    except OSError:
+                        pass
+                except Exception:
+                    logger.exception("Failed copying active state file to %s", new_active)
+
+            # Move index row
+            transfer_row = None
+            if old_index_csv and os.path.exists(old_index_csv):
+                try:
+                    kept_rows = []
+                    with open(old_index_csv, "r", newline="") as f:
+                        for r in csv.DictReader(f):
+                            if r.get("heat_id") == heat_id:
+                                transfer_row = dict(r)
+                            else:
+                                kept_rows.append(r)
+                    with open(old_index_csv, "w", newline="") as f:
+                        w = csv.DictWriter(f, fieldnames=INDEX_HEADERS)
+                        w.writeheader()
+                        for r in kept_rows:
+                            w.writerow({k: r.get(k, "") for k in INDEX_HEADERS})
+                except Exception:
+                    logger.exception("Failed removing %s from %s", heat_id, old_index_csv)
+
+            if not os.path.exists(self.index_csv) or os.path.getsize(self.index_csv) == 0:
+                try:
+                    with open(self.index_csv, "w", newline="") as f:
+                        csv.writer(f).writerow(INDEX_HEADERS)
+                except Exception:
+                    pass
+
+            if transfer_row is None:
+                transfer_row = {
+                    "heat_id": heat_id,
+                    "start_time": sm.heat_start.isoformat() if sm.heat_start else "",
+                    "end_time": "",
+                    "duration_minutes": "",
+                    "tilt_count": str(sm.tilt_count),
+                    "status": "IN_PROGRESS",
+                    "csv_file": os.path.basename(sm.heat_csv_path) if sm.heat_csv_path else f"{heat_id}.csv",
+                    "last_updated": datetime.datetime.now().isoformat(timespec="seconds"),
+                }
+            else:
+                transfer_row["last_updated"] = datetime.datetime.now().isoformat(timespec="seconds")
+                if sm.heat_csv_path:
+                    transfer_row["csv_file"] = os.path.basename(sm.heat_csv_path)
+
+            try:
+                target_rows = []
+                found = False
+                if os.path.exists(self.index_csv):
+                    with open(self.index_csv, "r", newline="") as f:
+                        for r in csv.DictReader(f):
+                            if r.get("heat_id") == heat_id:
+                                target_rows.append(transfer_row)
+                                found = True
+                            else:
+                                target_rows.append(r)
+                if not found:
+                    target_rows.append(transfer_row)
+
+                with open(self.index_csv, "w", newline="") as f:
+                    w = csv.DictWriter(f, fieldnames=INDEX_HEADERS)
+                    w.writeheader()
+                    for r in target_rows:
+                        w.writerow({k: r.get(k, "") for k in INDEX_HEADERS})
+            except Exception:
+                logger.exception("Failed writing %s to %s", heat_id, self.index_csv)
+
+            try:
+                sm._save_active_state()
+            except Exception:
+                logger.exception("Failed saving active state for %s", heat_id)
+
+            logger.info(
+                "Process %s (state=%s) transferred from slot %s to slot %s",
+                heat_id, sm.state,
+                getattr(source_slot, "slug", "unknown"),
+                self.slug,
+            )
+            self.state_machine = sm
+            return sm
+
+    def ensure_state_machine(self):
+        if self.state_machine is None:
+            self.state_machine = HeatStateMachine(
+                data_dir=self.data_dir,
+                index_csv=self.index_csv,
+                recorder=self.recorder,
+                furnace_id=self.furnace_id,
+                heat_id_prefix=self.heat_id_prefix,
+                temperature_monitor=self.temperature_monitor,   # slot's own monitor
+                on_activefire_loss=self._handle_activefire_loss,
+            )
+            # Initially suspended until a camera connects
+            self.state_machine.note_camera_state(False)
+        return self.state_machine
+
     def attach_to_stream(self, stream):
-        """(Re)start the state machine + camera worker on a new stream.
-        The PYRO monitor is NOT touched — it stays with the slot."""
-        self.detach()
+        """(Re)bind the slot to a stream.
+        If a state machine is already running for this slot (with a heat in
+        progress), it is PRESERVED across stream swaps so mid-process RTSP
+        changes never break an ongoing heat. Only the CameraWorker is
+        replaced and pointed to the new RTSP URL. The PYRO monitor is NOT touched — it stays with the slot.
+        """
+        # Detach existing stream and stop its camera worker, but keep state machine alive
+        self.detach(keep_state_machine=True)
 
         self.current_stream = stream
         stream.assigned_slot = self.slug
         stream.mark("active", f"assigned to {self.slug}")
 
-        self.state_machine = HeatStateMachine(
-            data_dir=self.data_dir,
-            index_csv=self.index_csv,
-            recorder=self.recorder,
-            furnace_id=self.furnace_id,
-            heat_id_prefix=self.heat_id_prefix,
-            temperature_monitor=self.temperature_monitor,   # slot's own monitor
-            on_activefire_loss=self._handle_activefire_loss,
-        )
+        self.ensure_state_machine()
+        # Re-attaching to a stream: suspend activefire watchdog until new camera connects
+        self.state_machine.note_camera_state(False)
+
         self.camera_worker = CameraWorker(
             state_machine=self.state_machine,
             rtsp_url=stream.rtsp_url,
@@ -167,10 +329,18 @@ class FurnaceSlot:
             on_maintenance_detected=self._handle_maintenance_detected,
         )
         self.camera_worker.start()
-        logger.info("Slot %s bound to stream %s (PYRO %s)",
-                    self.slug, stream.stream_id, self.pyro_field)
+        logger.info(
+            "Slot %s bound to stream %s (PYRO %s, heat=%s, state=%s)",
+            self.slug, stream.stream_id, self.pyro_field,
+            getattr(self.state_machine, "heat_id", None),
+            getattr(self.state_machine, "state", None),
+        )
 
-    def detach(self):
+    def detach(self, keep_state_machine=False):
+        """Stop the camera worker and unbind current stream.
+        keep_state_machine: when True (e.g. during stream swap or re-evaluation),
+        preserves the in-flight HeatStateMachine so the ongoing heat continues.
+        """
         if self.camera_worker is not None:
             try:
                 self.camera_worker.stop()
@@ -180,7 +350,16 @@ class FurnaceSlot:
         if self.current_stream is not None:
             self.current_stream.assigned_slot = None
             self.current_stream = None
-        self.state_machine = None
+
+        if not keep_state_machine:
+            if self.state_machine is not None and hasattr(self.state_machine, "_save_active_state"):
+                self.state_machine._save_active_state()
+            self.state_machine = None
+        elif self.state_machine is not None:
+            # Suspend active-fire watchdog while camera feed is detached
+            self.state_machine.note_camera_state(False)
+            if hasattr(self.state_machine, "_save_active_state"):
+                self.state_machine._save_active_state()
 
     def _handle_activefire_loss(self):
         # Called from inside the camera worker thread. Don't do the swap
@@ -265,6 +444,8 @@ class FurnaceManager:
                 self.slots[slug].attach_to_stream(available[i])
             else:
                 logger.error("Not enough available streams to assign %s", slug)
+                if slug in self.slots:
+                    self.slots[slug].ensure_state_machine()
 
         for s in available[len(order):]:
             s.mark("spare", "not assigned to a slot")
@@ -456,6 +637,89 @@ class FurnaceManager:
         )
         self._reeval_thread.start()
 
+    def _plan_process_shifts(self, old_slot_state, assignment, slot_order):
+        """Determine how state machines / processes shift across slots during re-evaluation.
+
+        Specification / Rule:
+        1. When a stream moves from slot_src to slot_dest (e.g. rtsp2 is allocated
+           to slot1 and moves to slot2), the current process of slot_src must get
+           shifted to slot_dest with that rtsp.
+        2. When a stream exits maintenance and is assigned to slot_src (e.g. rtsp1
+           gets out of maintenance and is assigned to slot1), and a 3rd stream
+           (e.g. rtsp3 on slot2) is displaced:
+           - The current process of the 3rd rtsp (from slot2) must get shifted to slot1
+             IF NOT COMPLETED.
+           - If it is completed (IDLE), slot1 receives a fresh state machine.
+        3. If both streams swap slots (e.g. s1 -> slot2, s2 -> slot1), each slot
+           receives the process of the stream that moved into it.
+        4. If a slot's stream assignment is unchanged, it keeps its current process.
+        """
+        plan = {}
+        if len(slot_order) < 2:
+            for slug in slot_order:
+                plan[slug] = ("keep", old_slot_state[slug]["state_machine"], self.slots[slug])
+            return plan
+
+        s1_slug, s2_slug = slot_order[0], slot_order[1]
+        old_s1 = old_slot_state[s1_slug]["stream"]
+        old_s2 = old_slot_state[s2_slug]["stream"]
+        sm1 = old_slot_state[s1_slug]["state_machine"]
+        sm2 = old_slot_state[s2_slug]["state_machine"]
+
+        new_s1 = assignment.get(s1_slug)
+        new_s2 = assignment.get(s2_slug)
+
+        def is_incomplete(sm):
+            return (
+                sm is not None
+                and getattr(sm, "state", None) != HeatStateMachine.STATE_IDLE
+                and getattr(sm, "heat_id", None) is not None
+            )
+
+        # Check if stream from s1 moved to s2
+        s1_to_s2 = (old_s1 is not None and new_s2 is not None and old_s1.stream_id == new_s2.stream_id)
+        # Check if stream from s2 moved to s1
+        s2_to_s1 = (old_s2 is not None and new_s1 is not None and old_s2.stream_id == new_s1.stream_id)
+
+        if s1_to_s2 and s2_to_s1:
+            # Both streams swapped slots: processes follow their streams
+            plan[s1_slug] = ("transfer", sm2, self.slots[s2_slug])
+            plan[s2_slug] = ("transfer", sm1, self.slots[s1_slug])
+
+        elif s1_to_s2:
+            # Stream on slot1 (e.g. rtsp2) moved to slot2:
+            # Current process of slot1 must get shifted to slot2 with the rtsp
+            plan[s2_slug] = ("transfer", sm1, self.slots[s1_slug])
+
+            # Displaced stream on slot2 (e.g. rtsp3):
+            # Current process of 3rd rtsp must get shifted to slot1 (if not completed)
+            if is_incomplete(sm2):
+                plan[s1_slug] = ("transfer", sm2, self.slots[s2_slug])
+            else:
+                plan[s1_slug] = ("fresh", None, None)
+
+        elif s2_to_s1:
+            # Stream on slot2 moved to slot1:
+            plan[s1_slug] = ("transfer", sm2, self.slots[s2_slug])
+
+            # Displaced stream on slot1:
+            if is_incomplete(sm1):
+                plan[s2_slug] = ("transfer", sm1, self.slots[s1_slug])
+            else:
+                plan[s2_slug] = ("fresh", None, None)
+
+        else:
+            for slug in slot_order:
+                old_s = old_slot_state[slug]["stream"]
+                new_s = assignment.get(slug)
+                curr_sm = old_slot_state[slug]["state_machine"]
+                if old_s is not None and new_s is not None and old_s.stream_id == new_s.stream_id:
+                    plan[slug] = ("keep", curr_sm, self.slots[slug])
+                else:
+                    plan[slug] = ("keep", curr_sm, self.slots[slug])
+
+        return plan
+
     def _reevaluate_streams(self, failing_slot, excluded_stream_id=None):
         """Probe all three streams for class 5 in parallel, then reassign
         slots by strict priority.
@@ -602,8 +866,18 @@ class FurnaceManager:
                             assignment[slug] = cold_streams[i]
 
                 # ---- Apply -----------------------------------------------------
-                # Release any stream being vacated before attaching, so a stream
-                # shifting between slots (e.g. 4/2 -> 4/1) isn't accidentally
+                # 1. Snapshot old slot state before detaching
+                old_slot_state = {
+                    slug: {
+                        "stream": self.slots[slug].current_stream,
+                        "state_machine": self.slots[slug].state_machine,
+                    }
+                    for slug in slot_order
+                }
+                process_plan = self._plan_process_shifts(old_slot_state, assignment, slot_order)
+
+                # 2. Release any stream being vacated before attaching, so a stream
+                # shifting between slots (e.g. 5/2 -> 5/1) isn't accidentally
                 # cleared when the second slot releases its old binding.
                 for slug in slot_order:
                     slot = self.slots[slug]
@@ -615,12 +889,24 @@ class FurnaceManager:
                         old.assigned_slot = None
                         if old.status != "maintenance":
                             old.mark("spare", f"released by {slug} during re-evaluation")
-                        slot.detach()
+                        slot.detach(keep_state_machine=True)
 
+                # 3. Apply process / state machine shifts across slots
+                for slug in slot_order:
+                    slot = self.slots[slug]
+                    action, source_sm, src_slot = process_plan[slug]
+                    if action == "transfer":
+                        slot.adopt_state_machine(source_sm, source_slot=src_slot)
+                    elif action == "fresh":
+                        slot.state_machine = None
+                    elif action == "keep":
+                        pass
+
+                # 4. Attach new streams to slots
                 for slug in slot_order:
                     slot = self.slots[slug]
                     new_stream = assignment.get(slug)
-                    if new_stream is slot.current_stream:
+                    if new_stream is slot.current_stream and slot.camera_worker is not None:
                         continue
                     if new_stream is not None:
                         slot.attach_to_stream(new_stream)
@@ -629,8 +915,8 @@ class FurnaceManager:
                             slug, new_stream.stream_id, slot.pyro_field,
                         )
                     else:
-                        slot.detach()
-                        logger.warning("Slot %s left unassigned", slug)
+                        slot.detach(keep_state_machine=True)
+                        logger.warning("Slot %s left unassigned (in-progress heat preserved)", slug)
 
                 # ---- Anything not assigned becomes spare ----------------------
                 assigned_ids = {s.stream_id for s in assignment.values()}

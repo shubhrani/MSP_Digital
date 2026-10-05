@@ -20,6 +20,7 @@ Key rules:
 """
 import csv
 import datetime
+import json
 import os
 import shutil
 import sys
@@ -1129,6 +1130,90 @@ def test_maintenance_detection_classes():
     print("test_maintenance_detection_classes passed")
 
 
+def test_crash_recovery_with_active_state_json():
+    """Verify that state.json persists in-flight heat data and crash recovery restores
+    exact stage, tilt_count, and scrap_charging_confirmed."""
+    shutil.rmtree(TMP_DIR, ignore_errors=True)
+    os.makedirs(TMP_DIR, exist_ok=True)
+    data_dir = os.path.join(TMP_DIR, "heats")
+    index_csv = os.path.join(TMP_DIR, "heats_index.csv")
+
+    sm1 = HeatStateMachine(data_dir=data_dir, index_csv=index_csv,
+                           temperature_monitor=MockTemperatureMonitor())
+
+    t0 = datetime.datetime.now() - datetime.timedelta(minutes=30)
+    # Start heat with scrap
+    sm1.process_detections({CLS_MAGNET_FEEDING_SCRAP}, t0)
+    heat_id = sm1.heat_id
+    assert sm1.state == sm1.STATE_SCRAP_CHARGING
+    assert sm1._scrap_charging_confirmed is True
+
+    # State JSON must exist
+    state_file = os.path.join(data_dir, f"{heat_id}.state.json")
+    assert os.path.exists(state_file)
+
+    # Transition to sponge charging
+    t1 = t0 + datetime.timedelta(minutes=10)
+    sm1.process_detections({CLS_SPONGE_FEEDER_ON_FURNACE}, t1)
+    assert sm1.state == sm1.STATE_SPONGE_CHARGING
+
+    # Perform a tilt
+    t2 = t1 + datetime.timedelta(minutes=5)
+    sm1.process_detections({CLS_FURNACE_TILTING}, t2)
+    t3 = t2 + datetime.timedelta(seconds=20)
+    sm1.process_detections({CLS_FURNACE_NORMAL}, t3)
+    assert sm1.tilt_count == 1
+
+    # Verify state.json content
+    with open(state_file, "r") as f:
+        saved = json.load(f)
+    assert saved["state"] == "SPONGE_CHARGING"
+    assert saved["tilt_count"] == 1
+    assert saved["scrap_charging_confirmed"] is True
+
+    # SIMULATE CORE DUMP & RESTART: destroy sm1 without finalize_tapping
+    del sm1
+
+    # Re-initialize state machine (as would happen on process supervisor restart)
+    sm2 = HeatStateMachine(data_dir=data_dir, index_csv=index_csv,
+                           temperature_monitor=MockTemperatureMonitor())
+
+    # Heat must be seamlessly resumed!
+    assert sm2.heat_id == heat_id
+    assert sm2.state == sm2.STATE_SPONGE_CHARGING
+    assert sm2.tilt_count == 1
+    assert sm2._scrap_charging_confirmed is True
+    # Camera watchdog suspended pending reconnection
+    assert sm2._camera_connected is False
+
+    # Simulate camera connects and detection arrives
+    t4 = datetime.datetime.now()
+    sm2.note_camera_state(True)
+    assert sm2._camera_connected is True
+
+    # Count another tilt on resumed heat
+    t5 = t4 + datetime.timedelta(minutes=2)
+    sm2.process_detections({CLS_FURNACE_TILTING}, t5)
+    t6 = t5 + datetime.timedelta(seconds=20)
+    sm2.process_detections({CLS_FURNACE_NORMAL}, t6)
+    assert sm2.tilt_count == 2
+
+    # Finish tapping
+    t7 = t6 + datetime.timedelta(minutes=5)
+    sm2.process_detections({CLS_LADDLE_PLACED_FORTAPPING}, t7)
+    assert sm2.state == sm2.STATE_TAPPING
+
+    t8 = t7 + datetime.timedelta(minutes=1)
+    sm2.process_detections({CLS_FURNACE_TILTING}, t8)
+    t9 = t8 + datetime.timedelta(seconds=30)
+    sm2.process_detections({CLS_FURNACE_NORMAL}, t9)
+    # Heat completed
+    assert sm2.state == sm2.STATE_SCRAP_CHARGING  # auto_next heat started
+    assert not os.path.exists(state_file)  # completed heat state file cleared
+
+    print("test_crash_recovery_with_active_state_json passed")
+
+
 if __name__ == "__main__":
     test_scrap_charging_class_ids()
     test_sponge_charging_class_ids()
@@ -1164,5 +1249,6 @@ if __name__ == "__main__":
     test_resume_uses_last_updated_not_start_time()
     test_no_resume_when_heartbeat_is_stale()
     test_maintenance_detection_classes()
+    test_crash_recovery_with_active_state_json()
 
     print("\nAll state-machine tests passed successfully!")
