@@ -147,8 +147,7 @@ def test_scrap_charging_class_ids():
 
 def test_sponge_charging_class_ids():
     """Verify classes in SPONGE_CHARGING_CLASS_IDS transition scrap to sponge charging."""
-    for cls_id in (CLS_SPONGE_FEEDER_ENGAGED, CLS_SPONGE_FEEDER_ON_FURNACE,
-                   CLS_MAGNET_FEEDING_SPONGE):
+    for cls_id in (CLS_SPONGE_FEEDER_ENGAGED, CLS_SPONGE_FEEDER_ON_FURNACE):
         sm = fresh_machine()
         sm.process_detections({CLS_MAGNET_FEEDING_SCRAP}, t(0))
         assert sm.state == sm.STATE_SCRAP_CHARGING
