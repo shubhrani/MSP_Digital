@@ -29,32 +29,20 @@ Process sequence (43-class model + InfluxDB PYRO temperature):
   - Tilt counting: Returning to normal counts as a tilt unless it occurs
     within 45 seconds of the previous counted tilt's end (TILT_MIN_GAP = 45s).
 
-  - Tapping is entered by one of two paths:
-
-      (A) Class 36 (laddle_placed_fortapping) confirmed -> tapping starts
-          IMMEDIATELY at that timestamp. No pre-roll, no candidate window.
-          The heat remains in TAPPING until a normal end-of-tapping rule
-          fires (below).
-
-      (B) Class 18 (furnace_bottom_visiblecompletely) opens a 5-minute
-          tapping candidate window. Tapping is confirmed if:
-            * class 25 (laddle_moving_withmeltiron) is detected.
-          (PYRO data changes do NOT confirm tapping).
-          Tapping start is backdated by a 90-second pre-roll before class 18
-          (tap_candidate_start - 90s, clamped to sponge_start), and the
-          heat completes immediately on confirmation.
-          If the window expires with no signal, the movement resolves as
-          a tilt.
-
-  - End of tapping (identical for both paths):
-      * class 1 (furnace_position_normal) detected   -> tapping ends,
-      * 15 minutes pass since tapping_start          -> TAPPING_MAX_MINUTES cap,
-      * next scrap class (24/21/37) detected         -> tapping ends and the
-        next heat begins from the scrap timestamp.
+  - Stage 3: Tapping (Single Unified Logic)
+    1. Tapping is entered EXCLUSIVELY when class 36 (laddle_placed_fortapping) is detected.
+       Tapping starts immediately at that timestamp. No candidate window or backdating.
+    2. Once tapping starts:
+       - The furnace must move away from normal (17, 18, 34, 35).
+       - When it returns back to normal (1 furnace_position_normal), tapping ends.
+    3. Maximum time of tapping cannot be more than 12 minutes (TAPPING_MAX_MINUTES = 12).
+       If furnace_position_normal is missed, tapping safely caps and completes at 12 minutes.
+    4. If scrap charging (24/21/37) is detected during tapping, tapping ends immediately
+       and the next heat begins from that scrap timestamp.
 
   Heat Completion (Tapping -> IDLE):
-    - 1 (furnace_position_normal) is detected while TAPPING, or
-    - 15 minutes have passed since tapping started (safety timeout cap), or
+    - Furnace moves away from normal and then returns back to normal (class 1), or
+    - 12 minutes have passed since tapping started (safety timeout cap), or
     - 24/21/37 (scrap feeding) detected (next heat begins immediately).
 
   Active-Fire Watchdog:
@@ -144,34 +132,30 @@ SCRAP_CHARGING_CLASS_IDS = {
 }
 
 SPONGE_CHARGING_CLASS_IDS = {
-    CLS_SPONGE_FEEDER_ENGAGED,           # was 6, now 4
-    CLS_SPONGE_FEEDER_ON_FURNACE,        # was 10, now 15
+    CLS_SPONGE_FEEDER_ENGAGED,           # 4
+    CLS_SPONGE_FEEDER_ON_FURNACE,        # 15
+    CLS_MAGNET_FEEDING_SPONGE,           # 2
 }
 
 # Any of these classes indicate furnace movement away from normal
-# position during SPONGE CHARGING. Temperature decides whether it is
-# tapping or a tilt.
+# position during SPONGE CHARGING or TAPPING.
 FURNACE_MOVEMENT_CLASS_IDS = {
-    CLS_FURNACE_POSITION_UP,                # was 2, now 34
-    CLS_FURNACE_BOTTOM_VISIBLE_PARTIALLY,   # was 8, now 35
-    CLS_FURNACE_TILTING,                    # was 18, now 17
-    CLS_FURNACE_BOTTOM_VISIBLE_COMPLETELY,  # was 24, now 18
+    CLS_FURNACE_POSITION_UP,                # 34
+    CLS_FURNACE_BOTTOM_VISIBLE_PARTIALLY,   # 35
+    CLS_FURNACE_TILTING,                    # 17
+    CLS_FURNACE_BOTTOM_VISIBLE_COMPLETELY,  # 18
 }
 
 FURNACE_NORMAL_CLASS_IDS = {
-    CLS_FURNACE_NORMAL,                     # was 9, now 1
+    CLS_FURNACE_NORMAL,                     # 1
 }
 
 ACTIVEFIRE_CLASS_IDS = {
-    CLS_FURNACE_ACTIVEFIRE,                 # was 3, now 5
+    CLS_FURNACE_ACTIVEFIRE,                 # 5
 }
 
-# Classes that open the 5-minute tapping candidate window.
-# Only class 18 remains: class 36 (laddle_placed_fortapping) is now a
-# first-class tapping trigger handled separately - see _handle_sponge_movement.
-TAPPING_CANDIDATE_OPENERS = {
-    CLS_FURNACE_BOTTOM_VISIBLE_COMPLETELY,   # 18
-}
+# Tapping uses single class 36 trigger; candidate window openers are deprecated
+TAPPING_CANDIDATE_OPENERS = set()
 
 # Maintenance classes indicating the furnace is under maintenance
 UNDERMAINTENANCE_CLASS_IDS = {
@@ -221,7 +205,7 @@ INDEX_HEADERS = ["heat_id", "start_time", "end_time", "duration_minutes",
 EXPECTED_DURATION_MIN = {
     "scrap_charging": (0, 45),
     "sponge_charging": (90, 120),
-    "tapping": (10, 20),
+    "tapping": (2, 12),
 }
 
 # ---------------------------------------------------------------------------
@@ -232,7 +216,8 @@ SCRAP_MAX_MINUTES = 45
 SCRAP_MAX_THRESHOLD = datetime.timedelta(minutes=SCRAP_MAX_MINUTES)
 
 # Maximum tapping duration before automatic heat completion if normal position is missed.
-TAPPING_MAX_MINUTES = 15
+# Single tapping logic rule: maximum time of tapping cannot be more than 12 minutes.
+TAPPING_MAX_MINUTES = int(getattr(config, "TAPPING_MAX_MINUTES", 12))
 TAPPING_MAX_THRESHOLD = datetime.timedelta(minutes=TAPPING_MAX_MINUTES)
 
 # Active-fire watchdog timeout.
@@ -404,7 +389,7 @@ class HeatStateMachine:
             # AFTER the furnace has actually moved away from normal (tilt / bottom
             # visible) and come back.
             if self.state == self.STATE_TAPPING:
-                if newly_confirmed_ids & FURNACE_MOVEMENT_CLASS_IDS:
+                if newly_confirmed_ids & (FURNACE_MOVEMENT_CLASS_IDS | AWAY_FROM_NORMAL_CLASS_IDS):
                     self.tapping_movement_seen = True
                 if newly_confirmed_ids & FURNACE_NORMAL_CLASS_IDS:
                     if (not self.tapping_requires_movement) or self.tapping_movement_seen:
@@ -823,38 +808,19 @@ class HeatStateMachine:
         return [self.temperature_monitor] if self.temperature_monitor is not None else []
 
     def _handle_sponge_movement(self, ids, timestamp):
-        # 1. Class 36 (laddle_placed_fortapping) is a first-class tapping
-        #    trigger: the ladle was physically placed, so tapping starts NOW.
-        #    Checked before the candidate-window logic so a stray class 18
-        #    that already opened a window cannot delay or backdate this.
+        # 1. Class 36 (laddle_placed_fortapping) is the single tapping trigger:
+        #    the ladle was physically placed, so tapping starts IMMEDIATELY.
         if CLS_LADDLE_PLACED_FORTAPPING in ids:
             self._begin_tapping_from_ladle(timestamp)
             return
 
-        # 2. If a candidate window is open, ladle (25) confirms tapping.
-        if self.tap_candidate_active:
-            if CLS_LADDLE_MOVING_WITHMELTIRON in ids:
-                self._confirm_tapping(
-                    timestamp,
-                    f"laddle_moving_withmeltiron (25) after {self.tap_candidate_opener}",
-                )
-                return
-            if self._check_tapping_candidate(timestamp):
-                return
-
-        # 3. Furnace leaves normal -> start a movement cycle.
+        # 2. Furnace leaves normal -> start a movement cycle.
         if (ids & AWAY_FROM_NORMAL_CLASS_IDS) and not self.furnace_moving:
             self.furnace_moving = True
             self.furnace_move_start = timestamp
             self.last_event_desc = f"{self.heat_id}: furnace moved away from normal"
 
-        # 4. Class 18 opens the 5-minute tapping candidate window.
-        opener_hits = ids & TAPPING_CANDIDATE_OPENERS
-        if opener_hits and not self.tap_candidate_active:
-            opener_cls = sorted(opener_hits)[0]
-            self._begin_tapping_candidate(timestamp, opener_cls)
-
-        # 5. Class 1 (furnace_position_normal) ends the movement cycle.
+        # 3. Class 1 (furnace_position_normal) ends the movement cycle.
         if (ids & FURNACE_NORMAL_CLASS_IDS) and self.furnace_moving:
             self._on_return_to_normal(timestamp)
 
@@ -862,12 +828,6 @@ class HeatStateMachine:
         move_start = self.furnace_move_start or timestamp
         self.furnace_moving = False
         self.furnace_move_start = None
-
-        if self.tap_candidate_active:
-            # Tapping check still running: decide when it resolves.
-            self.pending_tilt = (move_start, timestamp)
-            self.last_event_desc = f"{self.heat_id}: furnace back to normal, tapping check still running"
-            return
         self._count_tilt(move_start, timestamp)
 
     def _count_tilt(self, move_start, move_end):
@@ -1017,6 +977,8 @@ class HeatStateMachine:
         self.state = self.STATE_TAPPING
 
         self._reset_furnace_watch()
+        self.tapping_requires_movement = True
+        self.tapping_movement_seen = False
 
         suffix = f" ({note})" if note else ""
 
@@ -1045,6 +1007,9 @@ class HeatStateMachine:
         tapping" path, which starts its own new heat at the scrap timestamp.
         """
         extended_end = end_timestamp + TAPPING_END_EXTENSION
+        # Enforce strict maximum duration of 12 minutes
+        if self.tapping_start and (extended_end - self.tapping_start) > TAPPING_MAX_THRESHOLD:
+            extended_end = self.tapping_start + TAPPING_MAX_THRESHOLD
 
         self._request_frame(
             "tapping_end", end_timestamp,

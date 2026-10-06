@@ -161,6 +161,9 @@ ACTIVEFIRE_TIMEOUT_MINUTES = float(
     os.getenv("ACTIVEFIRE_TIMEOUT_MINUTES", "25")
 )
 
+# Maximum tapping duration in minutes (safety cap if normal position is missed)
+TAPPING_MAX_MINUTES = float(os.getenv("TAPPING_MAX_MINUTES", "12"))
+
 # Maximum minutes to suspend active-fire watchdog during camera outages
 CAMERA_OUTAGE_GRACE_MINUTES = float(
     os.getenv("CAMERA_OUTAGE_GRACE_MINUTES", "30")
